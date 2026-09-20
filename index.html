@@ -406,6 +406,25 @@ const DEFAULT_RCPT = {
 const PAGAMENTI = [["contanti","💵"],["satispay","📲"],["carta","💳"],["omaggio","🎁"]];
 const isOmaggio = o => String(o && o.pay).toLowerCase() === "omaggio";
 const fmt = n => "€" + n.toFixed(2);
+
+/* ── GIORNATA DI UNO SCONTRINO ──
+   La data viene salvata come la scrive il dispositivo: Chrome su Windows
+   produce "19/09/2026", Safari su iPhone "19/9/2026". Sono lo stesso giorno,
+   ma come testo sono diverse e nel report comparivano come due giornate
+   separate, con gli incassi divisi a metà. Qui riportiamo tutto allo stesso
+   formato gg/mm/aaaa, così una giornata resta una giornata da qualunque
+   dispositivo arrivi lo scontrino. */
+const giornoDi = (d) => {
+  if (!d) return "";
+  const testa = String(d).split(",")[0].trim();
+  const p = testa.split("/");
+  if (p.length < 3) return testa;
+  const g = String(parseInt(p[0], 10) || 0).padStart(2, "0");
+  const m = String(parseInt(p[1], 10) || 0).padStart(2, "0");
+  let a = String(parseInt(p[2], 10) || 0);
+  if (a.length === 2) a = "20" + a;
+  return g + "/" + m + "/" + a;
+};
 let rcptN = parseInt(localStorage.getItem(EVENT_PREFIX+"rcpt_n") || "1");
 
 /* ── LOGIN ── */
@@ -1053,19 +1072,19 @@ function POS({ theme, toggleTheme }) {
     if (cat !== "Tutti" && !centroSelezionato && !menu.some(i => i.cat === cat)) setCat("Tutti");
   }, [centri, menu]);
 
-  const today = new Date().toLocaleDateString("it-IT");
+  const today = giornoDi(new Date().toLocaleDateString("it-IT"));
   const [reportDay, setReportDay] = useState(today); // giornata selezionata nel report ("all" = tutte)
 
   // Elenco delle giornate con ordini, dalla più recente alla più vecchia
   const reportDays = React.useMemo(() => {
     const set = {};
-    orders.forEach(o => { if (o.date) set[o.date.split(",")[0].trim()] = true; });
+    orders.forEach(o => { const g = giornoDi(o.date); if (g) set[g] = true; });
     const key = s => { const p = s.split("/"); return (+p[2])*10000 + (+p[1])*100 + (+p[0]); };
     return Object.keys(set).sort((a,b) => key(b) - key(a));
   }, [orders]);
 
   const { scopeO, scopeRev, totalRev, payBreak, topItems, omaggi, omaggiVal, centriBreak } = React.useMemo(() => {
-    const inScope = reportDay==="all" ? orders : orders.filter(o=>o.date && o.date.startsWith(reportDay));
+    const inScope = reportDay==="all" ? orders : orders.filter(o=>giornoDi(o.date) === reportDay);
     const _scopeRev = inScope.filter(o=>!isOmaggio(o)).reduce((s,o)=>s+(o.total||0),0);
     const _totalRev = orders.filter(o=>!isOmaggio(o)).reduce((s,o)=>s+(o.total||0),0);
     const _payBreak = inScope.reduce((a,o)=>{a[o.pay]=(a[o.pay]||0)+(o.total||0);return a;},{});
@@ -1665,6 +1684,7 @@ function POS({ theme, toggleTheme }) {
         <div style={{flex:1,overflowY:"auto",padding:"12px 10px"}}>
           <div style={{fontSize:18,fontWeight:900,color:"#f8fafc",marginBottom:14}}>⚙️ Impostazioni</div>
           <AdattaSchermo />
+          <SceltaStampante />
           <div style={{background:"#1e293b",borderRadius:10,padding:14,border:"1px solid #334155",marginBottom:10}}>
             <div style={{fontSize:14,fontWeight:700,color:"#f8fafc",marginBottom:10}}>🖨️ Rotolo Termico 80mm</div>
             {[["1️⃣","Collega la stampante termica via USB"],["2️⃣","Installa i driver dal sito del produttore"],["3️⃣","Impostala come stampante predefinita in Windows"],["4️⃣","Clicca Stampa → seleziona la termica"],["5️⃣","Imposta margini = Nessuno, scala = 100%"],["6️⃣","Salva come impostazioni predefinite"]].map(([n,t])=>(
@@ -1971,6 +1991,7 @@ function POS({ theme, toggleTheme }) {
         <div style={{padding:24,maxWidth:1000,margin:"0 auto",width:"100%",overflowY:"auto",flex:1,minHeight:0}}>
           <h2 style={{fontSize:24,fontWeight:900,marginBottom:24,color:"#f8fafc"}}>⚙️ Impostazioni</h2>
           <AdattaSchermo />
+          <SceltaStampante />
           <div style={{background:"#1e293b",borderRadius:12,padding:20,border:"1px solid #334155",marginBottom:16}}>
             <h3 style={{fontSize:15,fontWeight:700,marginBottom:14,color:"#f8fafc"}}>🖨️ Rotolo Termico 80mm</h3>
             <div style={{display:"flex",flexDirection:"column",gap:10}}>
@@ -3200,6 +3221,35 @@ function ScontrinoConfig({ cfg, save, reset, anteprima, centri, saveCentri, isMo
    sotto la barra delle applicazioni di Windows (o sotto il bordo dello
    schermo) e i tasti in fondo restano nascosti. Alza il margine finche' il
    tasto Incassa non ricompare: la scelta resta salvata su questo PC. */
+/* ── SCELTA STAMPANTE ──
+   Il browser non permette a una pagina web di scegliere la stampante: la
+   stampa diretta usa SEMPRE la predefinita di Windows. Qui spieghiamo a chi
+   sta in cassa come cambiarla, senza chiamare nessuno. */
+function SceltaStampante() {
+  const riga = (n, t) => (
+    <div key={n} style={{display:"flex",gap:12,background:"#0f172a",borderRadius:8,padding:"10px 14px",alignItems:"flex-start",marginBottom:6}}>
+      <span style={{fontSize:14,fontWeight:900,color:"#dc2626",flexShrink:0,minWidth:16}}>{n}</span>
+      <span style={{fontSize:13,color:"#cbd5e1",lineHeight:1.6}}>{t}</span>
+    </div>
+  );
+  return (
+    <div style={{background:"#1e293b",borderRadius:12,padding:16,border:"1px solid #334155",marginBottom:16}}>
+      <div style={{fontSize:15,fontWeight:700,marginBottom:8,color:"#f8fafc"}}>🖨️ Cambiare stampante</div>
+      <div style={{fontSize:13,color:"#94a3b8",lineHeight:1.6,marginBottom:12}}>
+        Gli scontrini escono sempre sulla <b>stampante predefinita di Windows</b>: è il browser
+        a imporlo, nessuna pagina web può scegliere la stampante da sola. Per cambiarla:
+      </div>
+      {riga("1", "Apri \"Cambia stampante\" sul desktop, scegli il numero della stampante e conferma il riavvio della cassa.")}
+      {riga("2", "In alternativa: Impostazioni di Windows › Bluetooth e dispositivi › Stampanti › scegli la stampante › \"Imposta come predefinita\". Poi chiudi e riapri CassaPro.")}
+      {riga("3", "Se devi scegliere la stampante volta per volta (stampante inceppata, report su A4) apri \"CassaPro - con anteprima\": lì si apre la finestra di stampa ogni volta.")}
+      <div style={{fontSize:12,color:"#64748b",marginTop:10,lineHeight:1.6}}>
+        Ricorda: in Windows deve restare <b>disattivata</b> l'opzione "Consenti a Windows di gestire
+        la stampante predefinita", altrimenti la cambia da solo.
+      </div>
+    </div>
+  );
+}
+
 function AdattaSchermo() {
   const [off, setOff] = useState(() => (window.cassaUiOffsetGet ? window.cassaUiOffsetGet() : 0));
   const set = (v) => { const n = window.cassaUiOffset ? window.cassaUiOffset(v) : 0; setOff(n); };
