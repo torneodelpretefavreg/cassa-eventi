@@ -1075,6 +1075,36 @@ function POS({ theme, toggleTheme }) {
   const today = giornoDi(new Date().toLocaleDateString("it-IT"));
   const [reportDay, setReportDay] = useState(today); // giornata selezionata nel report ("all" = tutte)
 
+  /* ── FILTRO REPORT PER CENTRO DI COSTO ──
+     Vuoto = tutti i centri. Si possono selezionare piu' centri insieme
+     (es. CALCIO + VARCO). Il filtro lavora sui singoli ARTICOLI, non sullo
+     scontrino intero: uno scontrino con bere e cibo conta solo per la parte
+     del centro scelto. Lo sconto dello scontrino e' ripartito in proporzione. */
+  const [reportCentri, setReportCentri] = useState([]);
+  const centriSel = React.useMemo(
+    () => reportCentri.filter(id => centri.some(c => c.id === id)), [reportCentri, centri]);
+  const toggleReportCentro = id =>
+    setReportCentri(p => p.includes(id) ? p.filter(x => x !== id) : [...p, id]);
+  const nomiFiltro = centriSel.length
+    ? centri.filter(c => centriSel.includes(c.id)).map(c => c.nome).join(" + ")
+    : "Tutti i centri";
+  const ordersF = React.useMemo(() => {
+    if (!centriSel.length) return orders;
+    const ok = new Set(centriSel);
+    const out = [];
+    orders.forEach(o => {
+      const tutti = o.items || [];
+      const items = tutti.filter(i => { const c = centroDi(centri, i.cat); return c && ok.has(c.id); });
+      if (!items.length) return;
+      const lordoTot = tutti.reduce((s,i)=>s+(i.price||0)*(i.qty||0), 0);
+      const fattore  = lordoTot ? (o.total||0)/lordoTot : 1;
+      const sub = items.reduce((s,i)=>s+(i.price||0)*(i.qty||0), 0);
+      const tot = sub * fattore;
+      out.push({ ...o, items, subtotal: sub, discAmt: sub - tot, total: tot, _orig: o });
+    });
+    return out;
+  }, [orders, centriSel, centri]);
+
   // Elenco delle giornate con ordini, dalla più recente alla più vecchia
   const reportDays = React.useMemo(() => {
     const set = {};
@@ -1084,9 +1114,9 @@ function POS({ theme, toggleTheme }) {
   }, [orders]);
 
   const { scopeO, scopeRev, totalRev, payBreak, topItems, omaggi, omaggiVal, centriBreak } = React.useMemo(() => {
-    const inScope = reportDay==="all" ? orders : orders.filter(o=>giornoDi(o.date) === reportDay);
+    const inScope = reportDay==="all" ? ordersF : ordersF.filter(o=>giornoDi(o.date) === reportDay);
     const _scopeRev = inScope.filter(o=>!isOmaggio(o)).reduce((s,o)=>s+(o.total||0),0);
-    const _totalRev = orders.filter(o=>!isOmaggio(o)).reduce((s,o)=>s+(o.total||0),0);
+    const _totalRev = ordersF.filter(o=>!isOmaggio(o)).reduce((s,o)=>s+(o.total||0),0);
     const _payBreak = inScope.reduce((a,o)=>{a[o.pay]=(a[o.pay]||0)+(o.total||0);return a;},{});
     const _omaggi   = inScope.filter(isOmaggio);
     const _omaggiVal= _omaggi.reduce((s,o)=>s+(o.total||0),0);
@@ -1112,7 +1142,13 @@ function POS({ theme, toggleTheme }) {
     });
     const _centri = Object.entries(_centriBreak).sort((a,b)=>b[1].tot-a[1].tot);
     return { scopeO:inScope, scopeRev:_scopeRev, totalRev:_totalRev, payBreak:_payBreak, topItems:_topItems, omaggi:_omaggi, omaggiVal:_omaggiVal, centriBreak:_centri };
-  }, [orders, reportDay, centri]);
+  }, [ordersF, reportDay, centri]);
+
+  // Nel nome del file finiscono i centri scelti (es. report_festival_19-09-2026_CALCIO-VARCO.xlsx)
+  const suffissoFile = () => centriSel.length
+    ? "_" + centri.filter(c => centriSel.includes(c.id)).map(c => c.nome).join("-")
+        .normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^A-Za-z0-9-]+/g, "_")
+    : "";
 
   const exportExcel = () => {
     const wb = XLSX.utils.book_new();
@@ -1124,6 +1160,7 @@ function POS({ theme, toggleTheme }) {
       [],
       ["RIEPILOGO"],
       ["Giornata",             reportDay==="all" ? "Tutte le giornate" : reportDay],
+      ["Centri di costo",      nomiFiltro],
       ["Incasso giornata (€)", Number(scopeRev.toFixed(2))],
       ["Scontrini giornata",   scopeO.length],
       ["Scontrino medio (€)",  scopeO.filter(o=>!isOmaggio(o)).length ? Number((scopeRev/scopeO.filter(o=>!isOmaggio(o)).length).toFixed(2)) : 0],
@@ -1132,7 +1169,7 @@ function POS({ theme, toggleTheme }) {
       ["Scontrini omaggio",    omaggi.length],
       [],
       ["Incasso totale " + EVT.nomeLungo + " (€)", Number(totalRev.toFixed(2))],
-      ["Scontrini totali " + EVT.nomeLungo,   orders.length],
+      ["Scontrini totali " + EVT.nomeLungo,   ordersF.length],
       [],
       ["METODI DI PAGAMENTO"],
       ["Metodo", "Totale (€)"],
@@ -1192,8 +1229,8 @@ function POS({ theme, toggleTheme }) {
     XLSX.utils.book_append_sheet(wb, ws3, "Articoli");
 
     // Download .xlsx
-    const dateStr = today.replace(/\//g, "-");
-    XLSX.writeFile(wb, "report_festival_" + dateStr + ".xlsx");
+    const dateStr = (reportDay === "all" ? today : reportDay).replace(/\//g, "-");
+    XLSX.writeFile(wb, "report_festival_" + dateStr + suffissoFile() + ".xlsx");
   };
 
   /* ══ EXPORT PDF ══
@@ -1224,6 +1261,7 @@ function POS({ theme, toggleTheme }) {
     doc.text(txt(EVT.nomeLungo), M, 34);
     doc.setFont("helvetica", "normal"); doc.setFontSize(11);
     doc.text("Report incassi  ·  " + txt(giornata), M, 54);
+    if (centriSel.length) { doc.setFontSize(9); doc.text("Centri di costo: " + txt(nomiFiltro), M, 68); }
     doc.setFontSize(9);
     doc.text("Generato il " + new Date().toLocaleString("it-IT"), W - M, 54, { align: "right" });
     doc.setTextColor(0);
@@ -1316,15 +1354,39 @@ function POS({ theme, toggleTheme }) {
     for (let p = 1; p <= tot; p++) {
       doc.setPage(p);
       doc.setFontSize(8); doc.setTextColor(140);
-      doc.text(txt(EVT.nomeLungo) + " · " + txt(giornata), M, doc.internal.pageSize.getHeight() - 20);
+      doc.text(txt(EVT.nomeLungo) + " · " + txt(giornata) + (centriSel.length ? " · " + txt(nomiFiltro) : ""), M, doc.internal.pageSize.getHeight() - 20);
       doc.text("Pagina " + p + " di " + tot, W - M, doc.internal.pageSize.getHeight() - 20, { align: "right" });
     }
 
     const dateStr = (reportDay === "all" ? today : reportDay).replace(/\//g, "-");
-    doc.save("report_festival_" + dateStr + ".pdf");
+    doc.save("report_festival_" + dateStr + suffissoFile() + ".pdf");
   };
 
   // Modale per inserire una nota libera sulla pizza (condivisa mobile + desktop)
+  const pillFiltro = on => ({ background:on?"#dc2626":"#1e293b", border:`1px solid ${on?"#dc2626":"#334155"}`,
+    color:on?"#fff":"#94a3b8", padding:"7px 13px", borderRadius:20, cursor:"pointer", fontSize:12,
+    fontWeight:700, fontFamily:"inherit", whiteSpace:"nowrap" });
+  const filtroCentriJSX = !modoSemplice && (
+    <div style={{background:"#1e293b",border:"1px solid "+(centriSel.length?"#b45309":"#334155"),borderRadius:10,padding:"10px 12px",marginBottom:14}}>
+      <div style={{fontSize:12,color:"#94a3b8",fontWeight:700,marginBottom:8}}>
+        🏭 Centri di costo nel report
+        {centriSel.length>0 && <span style={{color:"#fbbf24",fontWeight:600}}> · filtro attivo: {nomiFiltro}</span>}
+      </div>
+      <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+        <button onClick={()=>setReportCentri([])} style={pillFiltro(!centriSel.length)}>Tutti</button>
+        {centri.map(c => {
+          const on = centriSel.includes(c.id);
+          return <button key={c.id} onClick={()=>toggleReportCentro(c.id)} style={pillFiltro(on)}>{on?"✓ ":""}{etichetta(c)}</button>;
+        })}
+      </div>
+      {centriSel.length>0 && (
+        <div style={{fontSize:11,color:"#64748b",marginTop:8,lineHeight:1.5}}>
+          Incassi, statistiche, scontrini ed export (Excel e PDF) contano solo gli articoli dei centri selezionati.
+        </div>
+      )}
+    </div>
+  );
+
   const noteModalJSX = noteItem && (
     <div onClick={()=>{setNoteItem(null);setNoteText("");}} style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.75)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
       <div onClick={e=>e.stopPropagation()} style={{background:"#1e293b",border:"1px solid #334155",borderRadius:16,padding:20,maxWidth:380,width:"100%",maxHeight:"calc(var(--app-h, 100dvh) - 28px)",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,0.5)"}}>
@@ -1602,9 +1664,10 @@ function POS({ theme, toggleTheme }) {
               {reportDays.map(d=><option key={d} value={d}>{d}</option>)}
             </select>
           </div>
+          {filtroCentriJSX}
           {/* Stat cards */}
           <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
-            {[[reportDay==="all"?"Incasso":"Giornata",fmt(scopeRev),scopeO.filter(o=>!isOmaggio(o)).length+" scontrini"],["Omaggi",fmt(omaggiVal),omaggi.length+" scontrini"],["Media",scopeO.filter(o=>!isOmaggio(o)).length?fmt(scopeRev/scopeO.filter(o=>!isOmaggio(o)).length):"€0.00","per scontrino"],[EVT.totaleLabel,fmt(totalRev),orders.length+" scontrini"]].map(([l,v,s])=>(
+            {[[reportDay==="all"?"Incasso":"Giornata",fmt(scopeRev),scopeO.filter(o=>!isOmaggio(o)).length+" scontrini"],["Omaggi",fmt(omaggiVal),omaggi.length+" scontrini"],["Media",scopeO.filter(o=>!isOmaggio(o)).length?fmt(scopeRev/scopeO.filter(o=>!isOmaggio(o)).length):"€0.00","per scontrino"],[EVT.totaleLabel,fmt(totalRev),ordersF.length+" scontrini"]].map(([l,v,s])=>(
               <div key={l} style={{background:"#1e293b",borderRadius:10,padding:"12px 14px",border:"1px solid #334155",gridColumn:l===EVT.totaleLabel?"span 2":"auto"}}>
                 <div style={{fontSize:11,color:"#64748b",textTransform:"uppercase",letterSpacing:1,marginBottom:4}}>{l}</div>
                 <div style={{fontSize:22,fontWeight:900,color:"#4ade80"}}>{v}</div>
@@ -1651,8 +1714,8 @@ function POS({ theme, toggleTheme }) {
                   <span style={{fontWeight:900,color:"#4ade80",fontSize:14}}>{fmt(o.total)}</span>
                 </div>
                 <div style={{display:"flex",gap:6,marginTop:6}}>
-                  <button onClick={()=>editOrder(o)} style={{flex:1,background:"#1d4ed8",border:"none",color:"#fff",padding:"6px",borderRadius:6,cursor:"pointer",fontFamily:"inherit",fontSize:11,fontWeight:700}}>✏️ Modifica</button>
-                  <button onClick={()=>deleteOrder(o)} style={{flex:1,background:"#7f1d1d",border:"none",color:"#fca5a5",padding:"6px",borderRadius:6,cursor:"pointer",fontFamily:"inherit",fontSize:11,fontWeight:700}}>🗑 Annulla</button>
+                  <button onClick={()=>editOrder(o._orig||o)} style={{flex:1,background:"#1d4ed8",border:"none",color:"#fff",padding:"6px",borderRadius:6,cursor:"pointer",fontFamily:"inherit",fontSize:11,fontWeight:700}}>✏️ Modifica</button>
+                  <button onClick={()=>deleteOrder(o._orig||o)} style={{flex:1,background:"#7f1d1d",border:"none",color:"#fca5a5",padding:"6px",borderRadius:6,cursor:"pointer",fontFamily:"inherit",fontSize:11,fontWeight:700}}>🗑 Annulla</button>
                 </div>
               </div>
             ))}
@@ -1900,8 +1963,9 @@ function POS({ theme, toggleTheme }) {
               <button onClick={exportPDF} style={{background:"#b91c1c",border:"1px solid #dc2626",color:"#fff",padding:"10px 20px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>📄 Scarica PDF</button>
             </div>
           </div>
+          {filtroCentriJSX}
           <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:16,marginBottom:24}}>
-            {[[reportDay==="all"?"Incasso totale":"Incasso giornata",fmt(scopeRev),scopeO.filter(o=>!isOmaggio(o)).length+" scontrini"],["Omaggi",fmt(omaggiVal),omaggi.length+" scontrini"],["Scontrino medio",scopeO.filter(o=>!isOmaggio(o)).length?fmt(scopeRev/scopeO.filter(o=>!isOmaggio(o)).length):"€0.00","media"],[EVT.totaleLabel,fmt(totalRev),orders.length+" scontrini totali"]].map(([l,v,s])=>(
+            {[[reportDay==="all"?"Incasso totale":"Incasso giornata",fmt(scopeRev),scopeO.filter(o=>!isOmaggio(o)).length+" scontrini"],["Omaggi",fmt(omaggiVal),omaggi.length+" scontrini"],["Scontrino medio",scopeO.filter(o=>!isOmaggio(o)).length?fmt(scopeRev/scopeO.filter(o=>!isOmaggio(o)).length):"€0.00","media"],[EVT.totaleLabel,fmt(totalRev),ordersF.length+" scontrini totali"]].map(([l,v,s])=>(
               <div key={l} style={{background:"#1e293b",borderRadius:12,padding:20,border:"1px solid #334155"}}>
                 <div style={{fontSize:12,color:"#64748b",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>{l}</div>
                 <div style={{fontSize:28,fontWeight:900,color:"#4ade80"}}>{v}</div>
@@ -1962,8 +2026,8 @@ function POS({ theme, toggleTheme }) {
                   <span style={{textTransform:"capitalize",color:"#38bdf8"}}>{o.pay}</span>
                   <span style={{fontWeight:700,color:"#4ade80"}}>{fmt(o.total)}</span>
                   <div style={{display:"flex",gap:4}}>
-                    <button onClick={()=>editOrder(o)} title="Modifica" style={{background:"#1d4ed8",border:"none",color:"#fff",padding:"4px 8px",borderRadius:6,cursor:"pointer",fontSize:12}}>✏️</button>
-                    <button onClick={()=>deleteOrder(o)} title="Annulla" style={{background:"#7f1d1d",border:"none",color:"#fca5a5",padding:"4px 8px",borderRadius:6,cursor:"pointer",fontSize:12}}>🗑</button>
+                    <button onClick={()=>editOrder(o._orig||o)} title="Modifica" style={{background:"#1d4ed8",border:"none",color:"#fff",padding:"4px 8px",borderRadius:6,cursor:"pointer",fontSize:12}}>✏️</button>
+                    <button onClick={()=>deleteOrder(o._orig||o)} title="Annulla" style={{background:"#7f1d1d",border:"none",color:"#fca5a5",padding:"4px 8px",borderRadius:6,cursor:"pointer",fontSize:12}}>🗑</button>
                   </div>
                 </div>
               ))}
