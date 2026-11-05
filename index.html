@@ -501,8 +501,9 @@ function Login({ onLogin }) {
    useDatiEvento dati condivisi (ordini, comande, menu, centri, scontrino)
    useStampa     scontrini a video, stampa e cassetto
    useCassa      carrello e incasso: resta vivo cambiando pagina
-   PAGINE        registro di tutte le pagine (in fondo allo script)
-   Per aggiungere una pagina basta scrivere il componente e registrarlo.
+   TIPI_PAGINA   tipi di pagina disponibili (in fondo allo script)
+   Ogni evento salva il proprio elenco di pagine: per un tipo nuovo basta
+   scrivere il componente e registrarlo.
    ══════════════════════════════════════════════════════════════ */
 
 /* ── DATI DELL'EVENTO ── */
@@ -628,6 +629,32 @@ function useDatiEvento() {
   };
   const CATEGORIE = React.useMemo(() => catsDi(centri), [centri]);
 
+  // Pagine dell'evento (locale + sincronizzate su tutte le casse dell'evento)
+  const [pagine, setPagine] = useState(() => {
+    try { return fixPagine(JSON.parse(localStorage.getItem(EVENT_PREFIX+"pagine")||"null")); }
+    catch { return fixPagine(null); }
+  });
+  useEffect(() => {
+    if (!db) return;
+    const ref = db.ref(DB_ROOT+"/config/pagine");
+    const handler = snap => {
+      const val = snap.val();
+      if (Array.isArray(val) && val.length) {
+        const fixed = fixPagine(val);
+        setPagine(fixed);
+        localStorage.setItem(EVENT_PREFIX+"pagine", JSON.stringify(fixed));
+      }
+    };
+    ref.on("value", handler);
+    return () => ref.off("value", handler);
+  }, []);
+  const savePagine = (arr) => {
+    const fixed = fixPagine(arr);
+    setPagine(fixed);
+    localStorage.setItem(EVENT_PREFIX+"pagine", JSON.stringify(fixed));
+    if (db) db.ref(DB_ROOT+"/config/pagine").set(fixed);
+  };
+
   // Configurazione scontrino (locale + sincronizzata su tutte le casse)
   const [rcptCfg, setRcptCfg] = useState(() => {
     try { return {...DEFAULT_RCPT, ...(JSON.parse(localStorage.getItem(EVENT_PREFIX+"rcpt_cfg")||"{}"))}; }
@@ -671,7 +698,7 @@ function useDatiEvento() {
   const modoSemplice = centri.length <= 1;
 
   return { orders, setOrders, syncStatus, comande, menu, saveMenu, centri, saveCentri,
-           CATEGORIE, rcptCfg, saveRcptCfg, resetRcptCfg, modoSemplice };
+           CATEGORIE, rcptCfg, saveRcptCfg, resetRcptCfg, modoSemplice, pagine, savePagine };
 }
 
 /* ── SCONTRINI, STAMPA E CASSETTO ── */
@@ -759,7 +786,7 @@ function useStampa(dati, view, setView) {
 }
 
 /* ── CASSA ── */
-function useCassa(dati, stampa, setView, isMobile) {
+function useCassa(dati, stampa, setView, isMobile, paginaCassa) {
   const { orders, setOrders, comande, menu, centri, CATEGORIE, rcptCfg, modoSemplice } = dati;
   const { setLastR, setRcptIdx, printAllReceipts } = stampa;
   const [cart, setCart]     = useState([]);
@@ -1001,50 +1028,61 @@ function useCassa(dati, stampa, setView, isMobile) {
   /* Filtro a due livelli: prima i centri di costo (pochi tasti grandi), poi,
      solo se il centro ha più categorie, la riga delle sue categorie.
      cat vale "Tutti" | "c:<idCentro>" | "<nome categoria>" */
+  // Una cassa può mostrare solo alcuni centri. Il limite vale per la griglia:
+  // incasso, scontrini e comande lavorano sempre sul menu completo dell'evento.
+  const limiteCentri = paginaCassa ? paginaCassa.centri : [];
+  const centriPagina = React.useMemo(() => {
+    const scelti = centri.filter(c => limiteCentri.includes(c.id));
+    return scelti.length ? scelti : centri;
+  }, [centri, limiteCentri]);
+  const menuPagina = React.useMemo(() => centriPagina === centri ? menu
+    : menu.filter(i => centriPagina.some(c => c.cats.includes(i.cat))), [menu, centri, centriPagina]);
+  const catPagina = React.useMemo(() => centriPagina === centri ? CATEGORIE : catsDi(centriPagina), [centri, centriPagina, CATEGORIE]);
+  const semplicePagina = centriPagina.length <= 1;
   const catsConArticoli = React.useMemo(
-    () => CATEGORIE.filter(c => menu.some(i => i.cat === c)), [CATEGORIE, menu]);
+    () => catPagina.filter(c => menuPagina.some(i => i.cat === c)), [catPagina, menuPagina]);
   const centriConArticoli = React.useMemo(
-    () => centri.filter(c => menu.some(i => c.cats.includes(i.cat))), [centri, menu]);
+    () => centriPagina.filter(c => menuPagina.some(i => c.cats.includes(i.cat))), [centriPagina, menuPagina]);
   const centroSelezionato = React.useMemo(() => {
-    if (String(cat).startsWith("c:")) return centri.find(c => c.id === String(cat).slice(2)) || null;
-    return centri.find(c => c.cats.includes(cat)) || null;
-  }, [cat, centri]);
+    if (String(cat).startsWith("c:")) return centriPagina.find(c => c.id === String(cat).slice(2)) || null;
+    return centriPagina.find(c => c.cats.includes(cat)) || null;
+  }, [cat, centriPagina]);
   const sottoCategorie = React.useMemo(() => {
     if (!centroSelezionato) return [];
-    const usate = centroSelezionato.cats.filter(c => menu.some(i => i.cat === c));
+    const usate = centroSelezionato.cats.filter(c => menuPagina.some(i => i.cat === c));
     return usate.length > 1 ? usate : [];
-  }, [centroSelezionato, menu]);
+  }, [centroSelezionato, menuPagina]);
   const filtered = React.useMemo(() => {
     const q = search.toLowerCase();
-    return menu.filter(i => {
+    return menuPagina.filter(i => {
       if (!i.name.toLowerCase().includes(q)) return false;
       if (cat === "Tutti") return true;
       if (String(cat).startsWith("c:")) {
-        const c = centri.find(x => x.id === String(cat).slice(2));
+        const c = centriPagina.find(x => x.id === String(cat).slice(2));
         return c ? c.cats.includes(i.cat) : false;
       }
       return i.cat === cat;
     });
-  }, [menu, cat, search, centri]);
+  }, [menuPagina, cat, search, centriPagina]);
   /* La griglia non è mai un elenco piatto: con "Tutti" gli articoli sono divisi
      per centro di costo, dentro un centro sono divisi per categoria. Solo la
      ricerca testuale e la singola categoria mostrano una lista semplice. */
   const gruppiGriglia = React.useMemo(() => {
     if (search.trim()) return [{ key:"search", titolo:null, items:filtered }];
-    if (cat === "Tutti" && modoSemplice) {
+    if (cat === "Tutti" && semplicePagina) {
       const out = catsConArticoli
         .map(c => ({ key:c, titolo:c, items:filtered.filter(i => i.cat === c) }))
         .filter(g => g.items.length);
-      const coperte0 = new Set(catsDi(centri));
+      const coperte0 = new Set(catsDi(centriPagina));
       const resto0 = filtered.filter(i => !coperte0.has(i.cat));
       if (resto0.length) out.push({ key:"__altro", titolo:"⚠️ Senza categoria", items:resto0 });
       return out.length > 1 ? out : [{ key:"flat", titolo:null, items:filtered }];
     }
     if (cat === "Tutti") {
-      const out = centri
+      const out = centriPagina
         .map(c => ({ key:c.id, titolo:etichetta(c), items:filtered.filter(i => c.cats.includes(i.cat)) }))
         .filter(g => g.items.length);
-      const coperte = new Set(catsDi(centri));
+      const coperte = new Set(catsDi(centriPagina));
       const resto = filtered.filter(i => !coperte.has(i.cat));
       if (resto.length) out.push({ key:"__altro", titolo:"⚠️ Senza centro", items:resto });
       return out;
@@ -1054,14 +1092,14 @@ function useCassa(dati, stampa, setView, isMobile) {
       if (usate.length > 1) return usate.map(c => ({ key:c, titolo:c, items:filtered.filter(i => i.cat === c) }));
     }
     return [{ key:"flat", titolo:null, items:filtered }];
-  }, [filtered, cat, centri, centroSelezionato, search, modoSemplice, catsConArticoli]);
+  }, [filtered, cat, centriPagina, centroSelezionato, search, semplicePagina, catsConArticoli]);
 
   // Se il centro selezionato sparisce (rinominato o eliminato), torna a "Tutti"
   useEffect(() => {
-    if (cat !== "Tutti" && !centroSelezionato && !menu.some(i => i.cat === cat)) setCat("Tutti");
-  }, [centri, menu]);
+    if (cat !== "Tutti" && !centroSelezionato && !menuPagina.some(i => i.cat === cat)) setCat("Tutti");
+  }, [centriPagina, menuPagina]);
 
-  return { cart, cat, setCat, processing, search, setSearch, pay, setPay, disc, setDisc,
+  return { cart, cat, setCat, processing, search, setSearch, pay, setPay, disc, setDisc, semplicePagina,
            table, setTable, flash, variantPick, setVariantPick, variantSel, setVariantSel,
            noteItem, setNoteItem, noteText, setNoteText, subtotal, discAmt, total, cartCount,
            addItem, confirmNote, toggleVariant, confirmVariants, remItem, clearCart, checkout,
@@ -1130,10 +1168,9 @@ function ModaliCassa({ cassa }) {
 }
 
 /* ── PAGINA CASSA ── */
-function PaginaCassa({ dati, cassa, stampa, view, setView, isMobile }) {
-  const { modoSemplice } = dati;
+function PaginaCassa({ cassa, stampa, view, setView, isMobile }) {
   const { openDrawer } = stampa;
-  const { cart, cat, setCat, processing, search, setSearch, pay, setPay, disc, setDisc,
+  const { semplicePagina: modoSemplice, cart, cat, setCat, processing, search, setSearch, pay, setPay, disc, setDisc,
           table, setTable, subtotal, discAmt, total, cartCount, addItem, remItem, clearCart,
           checkout, catsConArticoli, centriConArticoli, centroSelezionato, sottoCategorie,
           filtered, gruppiGriglia } = cassa;
@@ -1441,6 +1478,10 @@ function PaginaScontrino({ dati, stampa, setView, isMobile }) {
 function useReport(dati, filtri) {
   const { orders, setOrders, centri, modoSemplice } = dati;
   const { reportDay, reportCentri, setReportCentri } = filtri;
+  const limitato = !!dati.limitato;
+  // Il centro di un articolo si cerca sempre tra tutti: tra i soli centri del report
+  // un articolo altrui finirebbe nel primo della lista
+  const tuttiCentri = dati.tuttiCentri || centri;
   const deleteAllOrders = () => {
     if (!window.confirm("Eliminare tutti i dati? Non si può annullare.")) return;
     if (db) { db.ref(DB_ROOT+"/orders").remove(); }
@@ -1466,8 +1507,11 @@ function useReport(dati, filtri) {
      (es. CALCIO + VARCO). Il filtro lavora sui singoli ARTICOLI, non sullo
      scontrino intero: uno scontrino con bere e cibo conta solo per la parte
      del centro scelto. Lo sconto dello scontrino e' ripartito in proporzione. */
-  const centriSel = React.useMemo(
+  const centriScelti = React.useMemo(
     () => reportCentri.filter(id => centri.some(c => c.id === id)), [reportCentri, centri]);
+  // Un report limitato conta sempre e solo i propri centri
+  const centriSel = React.useMemo(
+    () => centriScelti.length || !limitato ? centriScelti : centri.map(c => c.id), [centriScelti, limitato, centri]);
   const toggleReportCentro = id =>
     setReportCentri(p => p.includes(id) ? p.filter(x => x !== id) : [...p, id]);
   const nomiFiltro = centriSel.length
@@ -1479,7 +1523,7 @@ function useReport(dati, filtri) {
     const out = [];
     orders.forEach(o => {
       const tutti = o.items || [];
-      const items = tutti.filter(i => { const c = centroDi(centri, i.cat); return c && ok.has(c.id); });
+      const items = tutti.filter(i => { const c = centroDi(tuttiCentri, i.cat); return c && ok.has(c.id); });
       if (!items.length) return;
       const lordoTot = tutti.reduce((s,i)=>s+(i.price||0)*(i.qty||0), 0);
       const fattore  = lordoTot ? (o.total||0)/lordoTot : 1;
@@ -1488,7 +1532,7 @@ function useReport(dati, filtri) {
       out.push({ ...o, items, subtotal: sub, discAmt: sub - tot, total: tot, _orig: o });
     });
     return out;
-  }, [orders, centriSel, centri]);
+  }, [orders, centriSel, tuttiCentri]);
 
   // Elenco delle giornate con ordini, dalla più recente alla più vecchia
   const reportDays = React.useMemo(() => {
@@ -1517,7 +1561,7 @@ function useReport(dati, filtri) {
       const lordoScontrino = (o.items||[]).reduce((s,i)=>s+(i.price||0)*(i.qty||0), 0);
       const fattore = lordoScontrino ? (o.total||0)/lordoScontrino : 1;
       (o.items||[]).forEach(i => {
-        const c = centroDi(centri, i.cat);
+        const c = centroDi(tuttiCentri, i.cat);
         const k = c ? etichetta(c) : "— senza centro";
         const r = _centriBreak[k] || { tot:0, qty:0 };
         r.tot += (i.price||0)*(i.qty||0)*fattore;
@@ -1527,7 +1571,7 @@ function useReport(dati, filtri) {
     });
     const _centri = Object.entries(_centriBreak).sort((a,b)=>b[1].tot-a[1].tot);
     return { scopeO:inScope, scopeRev:_scopeRev, totalRev:_totalRev, payBreak:_payBreak, topItems:_topItems, omaggi:_omaggi, omaggiVal:_omaggiVal, centriBreak:_centri };
-  }, [ordersF, reportDay, centri]);
+  }, [ordersF, reportDay, tuttiCentri]);
 
   // Nel nome del file finiscono evento e centri scelti (es. report_festival_19-09-2026_CALCIO-VARCO.xlsx)
   const suffissoFile = () => centriSel.length
@@ -1757,7 +1801,7 @@ function useReport(dati, filtri) {
         {centriSel.length>0 && <span style={{color:"#fbbf24",fontWeight:600}}> · filtro attivo: {nomiFiltro}</span>}
       </div>
       <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-        <button onClick={()=>setReportCentri([])} style={pillFiltro(!centriSel.length)}>Tutti</button>
+        <button onClick={()=>setReportCentri([])} style={pillFiltro(!centriScelti.length)}>Tutti</button>
         {centri.map(c => {
           const on = centriSel.includes(c.id);
           return <button key={c.id} onClick={()=>toggleReportCentro(c.id)} style={pillFiltro(on)}>{on?"✓ ":""}{etichetta(c)}</button>;
@@ -1777,8 +1821,12 @@ function useReport(dati, filtri) {
 }
 
 /* ── PAGINA REPORT ── */
-function PaginaReport({ dati, cassa, filtriReport, isMobile }) {
+function PaginaReport({ dati: datiEvento, cassa, filtriReport, pagina, isMobile }) {
   const { editOrder } = cassa;
+  // Un report può contare solo alcuni centri (es. solo il bar)
+  const centriLimite = datiEvento.centri.filter(c => (pagina.centri || []).includes(c.id));
+  const limitato = centriLimite.length > 0;
+  const dati = limitato ? {...datiEvento, centri:centriLimite, tuttiCentri:datiEvento.centri, modoSemplice:centriLimite.length <= 1, limitato} : datiEvento;
   const { reportDay, setReportDay } = filtriReport;
   const { deleteAllOrders, deleteOrder, reportDays, ordersF, scopeO, scopeRev, totalRev,
           payBreak, topItems, omaggi, omaggiVal, centriBreak, exportExcel, exportPDF,
@@ -1857,9 +1905,11 @@ function PaginaReport({ dati, cassa, filtriReport, isMobile }) {
         ))}
       </div>
       <div style={{textAlign:"center",paddingBottom:20}}>
+        {!limitato && (
         <button onClick={deleteAllOrders} style={{background:"#7f1d1d",border:"1px solid #991b1b",color:"#fca5a5",padding:"10px 20px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:13}}>
           🗑 Azzera Dati
         </button>
+        )}
       </div>
     </div>
   );
@@ -1948,7 +1998,9 @@ function PaginaReport({ dati, cassa, filtriReport, isMobile }) {
         </div>
       </div>
       <div style={{textAlign:"center",marginTop:16}}>
+        {!limitato && (
         <button onClick={deleteAllOrders} style={{background:"#7f1d1d",border:"1px solid #991b1b",color:"#fca5a5",padding:"8px 20px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:13}}>🗑 Azzera Tutti i Dati</button>
+        )}
       </div>
     </div>
   );
@@ -1962,8 +2014,9 @@ function ContenitorePagina({ isMobile, children }) {
 }
 
 /* ── PAGINA CUCINA ── */
-function PaginaCucina({ dati, isMobile }) {
-  const { comande } = dati;
+function PaginaCucina({ dati, pagina, isMobile }) {
+  // Una stazione vede e gestisce solo le sue comande, anche quando svuota lo storico
+  const comande = pagina.stazione ? dati.comande.filter(c => c.centro === pagina.stazione) : dati.comande;
   // === FUNZIONI COMANDE (Cucina) ===
   const toggleComandaItem = (comanda, itemUid) => {
     const newItems = comanda.items.map(it =>
@@ -2011,6 +2064,7 @@ function PaginaCucina({ dati, isMobile }) {
 
   return (
     <ContenitorePagina isMobile={isMobile}>
+      {pagina.stazione && <div style={{fontSize:20,fontWeight:900,color:"#f8fafc",marginBottom:12}}>{pagina.stazione}</div>}
       <CucinaView comande={comande} toggleComandaItem={toggleComandaItem} evadiComanda={evadiComanda} consegnaScontrino={consegnaScontrino} deleteComanda={deleteComanda} archiviaComanda={archiviaComanda} riportaInAttesa={riportaInAttesa} svuotaStorico={svuotaStorico} isMobile={isMobile} />
     </ContenitorePagina>
   );
@@ -2035,6 +2089,7 @@ function PaginaImpostazioni({ dati, stampa, isMobile, apriEventi }) {
     <div style={{flex:1,overflowY:"auto",padding:"12px 10px"}}>
       <div style={{fontSize:18,fontWeight:900,color:"#f8fafc",marginBottom:14}}>⚙️ Impostazioni</div>
       <CartaEvento apriEventi={apriEventi} />
+      <EditorPagine dati={dati} />
       <AdattaSchermo />
       <SceltaStampante />
       <div style={{background:"#1e293b",borderRadius:10,padding:14,border:"1px solid #334155",marginBottom:10}}>
@@ -2058,6 +2113,7 @@ function PaginaImpostazioni({ dati, stampa, isMobile, apriEventi }) {
     <div style={{padding:24,maxWidth:1000,margin:"0 auto",width:"100%",overflowY:"auto",flex:1,minHeight:0}}>
       <h2 style={{fontSize:24,fontWeight:900,marginBottom:24,color:"#f8fafc"}}>⚙️ Impostazioni</h2>
       <CartaEvento apriEventi={apriEventi} />
+      <EditorPagine dati={dati} />
       <AdattaSchermo />
       <SceltaStampante />
       <div style={{background:"#1e293b",borderRadius:12,padding:20,border:"1px solid #334155",marginBottom:16}}>
@@ -2098,7 +2154,24 @@ function POS({ theme, toggleTheme, apriEventi }) {
     return () => window.removeEventListener("resize", h);
   }, []);
 
-  const cassa = useCassa(dati, stampa, setView, isMobile);
+  /* La pagina attiva nasce dall'elenco dell'evento. "cassa", "carrello" e "scontrino"
+     sono fasi dell'incasso: valgono per l'ultima pagina Cassa aperta. Se una pagina
+     viene tolta mentre è aperta, si passa alla prima disponibile. */
+  const { pagine } = dati;
+  const [cassaAperta, setCassaAperta] = useState(null);
+  const cassaCorrente = pagine.find(p => p.tipo === "cassa" && p.id === cassaAperta) || pagine.find(p => p.tipo === "cassa") || null;
+  const inIncasso = view === "cassa" || view === "carrello";
+  const pagina = view === "scontrino" ? PAGINA_SCONTRINO
+    : (inIncasso ? cassaCorrente : pagine.find(p => p.id === view)) || pagine[0];
+  const vista = pagina.tipo === "cassa" ? (view === "carrello" ? "carrello" : "cassa") : pagina.id;
+  const evidenziata = view === "carrello" || view === "scontrino" ? null : pagina.id;
+  const apriPagina = p => {
+    if (p.tipo === "cassa") { setCassaAperta(p.id); setView("cassa"); }
+    else setView(p.id);
+  };
+  const tantePagine = pagine.length > 5;
+
+  const cassa = useCassa(dati, stampa, setView, isMobile, cassaCorrente);
 
   // I filtri del report restano impostati quando si cambia pagina
   const today = giornoDi(new Date().toLocaleDateString("it-IT"));
@@ -2110,11 +2183,11 @@ function POS({ theme, toggleTheme, apriEventi }) {
   const { openDrawer } = stampa;
   const { flash } = cassa;
 
-  const pagina = PAGINE.find(p => p.viste.includes(view));
-  const contenutoPagina = pagina && (
-    <pagina.Componente dati={dati} cassa={cassa} stampa={stampa} filtriReport={filtriReport}
-                       view={view} setView={setView} isMobile={isMobile}
-                       apriEventi={() => apriEventi(cassa.cart.length > 0)} />
+  const Componente = pagina.tipo === "scontrino" ? PaginaScontrino : TIPI_PAGINA[pagina.tipo].Componente;
+  const contenutoPagina = (
+    <Componente key={pagina.id} pagina={pagina} dati={dati} cassa={cassa} stampa={stampa} filtriReport={filtriReport}
+                view={vista} setView={setView} isMobile={isMobile}
+                apriEventi={() => apriEventi(cassa.cart.length > 0)} />
   );
 
   /* ── MOBILE LAYOUT ── */
@@ -2134,10 +2207,10 @@ function POS({ theme, toggleTheme, apriEventi }) {
             {syncStatus==="connected"?"🟢 Sincronizzato":syncStatus==="connecting"?"🟡 Connessione...":syncStatus==="error"?"🔴 Errore sync":"⚫ Solo locale"}
           </div>
         </div>
-        <div style={{display:"flex",gap:6}}>
-          {PAGINE.filter(p=>!p.nascosta).map(({id:v,icona:ic})=>(
-            <button key={v} onClick={()=>setView(v)} style={{background:view===v?"#dc2626":"#334155",border:"none",color:"#fff",width:38,height:38,borderRadius:10,fontSize:18,cursor:"pointer"}}>
-              {ic}
+        <div style={{display:"flex",gap:6,...(tantePagine?{overflowX:"auto",minWidth:0}:{})}}>
+          {pagine.map(p=>(
+            <button key={p.id} title={p.nome} onClick={()=>apriPagina(p)} style={{background:evidenziata===p.id?"#dc2626":"#334155",border:"none",color:"#fff",width:38,height:38,borderRadius:10,fontSize:18,cursor:"pointer",...(tantePagine?{flexShrink:0}:{})}}>
+              {p.icona}
             </button>
           ))}
           <button onClick={toggleTheme} title="Cambia tema" style={{background:"#334155",border:"none",color:"#fff",width:38,height:38,borderRadius:10,fontSize:18,cursor:"pointer"}}>
@@ -2165,10 +2238,10 @@ function POS({ theme, toggleTheme, apriEventi }) {
 
       <nav className="topnav" style={{background:"#1e293b",padding:"12px 24px",display:"flex",alignItems:"center",gap:16,borderBottom:"1px solid #334155",flexWrap:"wrap",flexShrink:0}}>
         <div className="brand" style={{fontSize:19,fontWeight:800,color:"#f8fafc",marginRight:8,letterSpacing:"-0.4px",display:"flex",alignItems:"center",gap:9}}><Logo size={32}/>{EVT.nomeLungo}</div>
-        <div style={{display:"flex",gap:8}}>
-          {PAGINE.filter(p=>!p.nascosta).map(({id:v,icona,nome})=>(
-            <button key={v} onClick={()=>setView(v)} style={{background:view===v?"#dc2626":"transparent",border:`1px solid ${view===v?"#dc2626":"#334155"}`,color:view===v?"#fff":"#94a3b8",padding:"6px 14px",borderRadius:8,cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>
-              {icona+" "+nome}
+        <div style={{display:"flex",gap:8,...(tantePagine?{flexWrap:"wrap"}:{})}}>
+          {pagine.map(p=>(
+            <button key={p.id} onClick={()=>apriPagina(p)} style={{background:evidenziata===p.id?"#dc2626":"transparent",border:`1px solid ${evidenziata===p.id?"#dc2626":"#334155"}`,color:evidenziata===p.id?"#fff":"#94a3b8",padding:"6px 14px",borderRadius:8,cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>
+              {p.icona+" "+p.nome}
             </button>
           ))}
         </div>
@@ -3523,18 +3596,150 @@ function FirebaseConfig({ syncStatus }) {
   );
 }
 
-/* ══ REGISTRO DELLE PAGINE ══
-   Da qui nasce la barra di navigazione, uguale su telefono e computer.
-     viste     = valori di "view" serviti dalla pagina
-     nascosta  = pagina raggiungibile solo dal programma, senza voce in barra */
-const PAGINE = [
-  { id:"cassa",        icona:"🧾",   nome:"Cassa",        viste:["cassa","carrello"], Componente:PaginaCassa },
-  { id:"cucina",       icona:"🧑‍🍳", nome:"Cucina",       viste:["cucina"],           Componente:PaginaCucina },
-  { id:"report",       icona:"📊",   nome:"Report",       viste:["report"],           Componente:PaginaReport },
-  { id:"articoli",     icona:"🍔",   nome:"Articoli",     viste:["articoli"],         Componente:PaginaArticoli },
-  { id:"impostazioni", icona:"⚙️",   nome:"Impostazioni", viste:["impostazioni"],     Componente:PaginaImpostazioni },
-  { id:"scontrino",    viste:["scontrino"], Componente:PaginaScontrino, nascosta:true },
-];
+/* ══ TIPI DI PAGINA ══
+   Ogni evento salva un elenco di pagine, ognuna di uno di questi tipi.
+     unica   = al massimo una per evento
+     filtro  = "centri" (limita a certi centri di costo) | "stazione" (limita alle comande di una stazione) */
+const TIPI_PAGINA = {
+  cassa:        { nome:"Cassa",        icona:"🧾",   filtro:"centri",   Componente:PaginaCassa },
+  cucina:       { nome:"Cucina",       icona:"🧑‍🍳", filtro:"stazione", Componente:PaginaCucina },
+  report:       { nome:"Report",       icona:"📊",   filtro:"centri",   Componente:PaginaReport },
+  articoli:     { nome:"Articoli",     icona:"🍔",   unica:true,        Componente:PaginaArticoli },
+  impostazioni: { nome:"Impostazioni", icona:"⚙️",   unica:true,        Componente:PaginaImpostazioni },
+};
+// Lo scontrino è una fase dell'incasso: si apre dal programma e non ha voce in barra
+const PAGINA_SCONTRINO = { id:"scontrino", tipo:"scontrino" };
+const ID_RISERVATI = ["carrello", "scontrino"];
+
+const paginaDiTipo = (id, tipo) => ({ id, tipo, nome:TIPI_PAGINA[tipo].nome, icona:TIPI_PAGINA[tipo].icona, centri:[], stazione:"" });
+const paginePredefinite = () => ["cassa", "cucina", "report", "articoli", "impostazioni"].map(t => paginaDiTipo(t, t));
+
+// Protegge da dati vecchi o incompleti. Impostazioni c'è sempre: senza, l'evento
+// resterebbe senza modo di rimettere a posto le pagine.
+function fixPagine(arr) {
+  if (!Array.isArray(arr) || !arr.length) return paginePredefinite();
+  const out = [], ids = new Set();
+  arr.forEach(p => {
+    if (!p || !p.id || !TIPI_PAGINA[p.tipo] || ids.has(p.id) || ID_RISERVATI.includes(p.id)) return;
+    if (TIPI_PAGINA[p.tipo].unica && out.some(x => x.tipo === p.tipo)) return;
+    ids.add(p.id);
+    const base = TIPI_PAGINA[p.tipo];
+    out.push({ id:String(p.id), tipo:p.tipo, nome:String(p.nome || base.nome), icona:String(p.icona || base.icona),
+               centri:Array.isArray(p.centri) ? p.centri : [], stazione:String(p.stazione || "") });
+  });
+  if (!out.some(p => p.tipo === "impostazioni")) out.push(paginaDiTipo("impostazioni", "impostazioni"));
+  return out;
+}
+
+/* ── PAGINE DELL'EVENTO ── Editor in Impostazioni */
+function EditorPagine({ dati }) {
+  const { pagine, savePagine, centri } = dati;
+  const [aperta, setAperta] = useState(null);
+  const [tipoNuovo, setTipoNuovo] = useState("cassa");
+
+  const stazioni = [...new Set(centri.filter(c => c.comanda).map(c => c.stazione))];
+  const tipiAggiungibili = Object.keys(TIPI_PAGINA).filter(t => !TIPI_PAGINA[t].unica || !pagine.some(p => p.tipo === t));
+
+  const modifica = (id, campi) => savePagine(pagine.map(p => p.id === id ? {...p, ...campi} : p));
+  const sposta = (i, delta) => {
+    const copia = [...pagine], j = i + delta;
+    if (j < 0 || j >= copia.length) return;
+    [copia[i], copia[j]] = [copia[j], copia[i]];
+    savePagine(copia);
+  };
+  const togli = (p) => {
+    if (!window.confirm("Togliere la pagina «" + p.nome + "»? Incassi, comande e menu non vengono toccati.")) return;
+    savePagine(pagine.filter(x => x.id !== p.id));
+  };
+  const aggiungi = () => {
+    const tipo = tipiAggiungibili.includes(tipoNuovo) ? tipoNuovo : tipiAggiungibili[0];
+    if (!tipo) return;
+    const id = tipo + "-" + Date.now().toString(36);
+    savePagine([...pagine, paginaDiTipo(id, tipo)]);
+    setAperta(id);
+  };
+  const scambiaCentro = (p, id) => modifica(p.id, { centri:p.centri.includes(id) ? p.centri.filter(x => x !== id) : [...p.centri, id] });
+
+  const tasto = { background:"#334155", border:"none", color:"#fff", minWidth:36, height:36, padding:"0 9px", borderRadius:8, cursor:"pointer", fontFamily:"inherit", fontSize:13, fontWeight:700 };
+  const campo = { width:"100%", background:"#0f172a", border:"1px solid #334155", color:"#e2e8f0", padding:"9px 10px", borderRadius:8, fontSize:14, fontFamily:"inherit", outline:"none" };
+  const pill = on => ({ background:on?"#dc2626":"#0f172a", border:"1px solid "+(on?"#dc2626":"#334155"), color:on?"#fff":"#94a3b8", padding:"7px 12px", borderRadius:20, cursor:"pointer", fontSize:12, fontWeight:700, fontFamily:"inherit" });
+
+  return (
+    <div data-eventi style={{background:"#1e293b",borderRadius:12,padding:14,border:"1px solid #334155",marginBottom:14}}>
+      <div style={{fontSize:15,fontWeight:800,color:"#f8fafc"}}>📑 Pagine di questo evento</div>
+      <div style={{fontSize:12,color:"#94a3b8",marginBottom:10}}>Valgono per tutte le casse dell'evento. Togliere una pagina non cancella dati.</div>
+
+      {pagine.map((p, i) => (
+        <div key={p.id} data-pagina={p.id} style={{background:"#0f172a",border:"1px solid #334155",borderRadius:10,padding:10,marginBottom:8}}>
+          <div style={{display:"flex",alignItems:"center",gap:6}}>
+            <div style={{fontSize:20,width:28,textAlign:"center",flexShrink:0}}>{p.icona}</div>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{fontSize:14,fontWeight:800,color:"#f8fafc",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{p.nome}</div>
+              <div style={{fontSize:11,color:"#94a3b8",overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{descriviPagina(p, centri)}</div>
+            </div>
+            <button aria-label={"Sposta su "+p.nome} disabled={i===0} onClick={()=>sposta(i,-1)} style={{...tasto,opacity:i===0?0.35:1}}>↑</button>
+            <button aria-label={"Sposta giù "+p.nome} disabled={i===pagine.length-1} onClick={()=>sposta(i,1)} style={{...tasto,opacity:i===pagine.length-1?0.35:1}}>↓</button>
+            <button aria-label={"Modifica "+p.nome} onClick={()=>setAperta(aperta===p.id?null:p.id)} style={tasto}>✏️</button>
+          </div>
+
+          {aperta === p.id && (
+            <div style={{marginTop:10,borderTop:"1px solid #334155",paddingTop:10}}>
+              <div style={{display:"flex",gap:8}}>
+                <input aria-label="Icona" value={p.icona} onChange={e=>modifica(p.id,{icona:e.target.value})} style={{...campo,width:58,textAlign:"center",flexShrink:0}} />
+                <input aria-label="Nome pagina" value={p.nome} onChange={e=>modifica(p.id,{nome:e.target.value})} style={campo} />
+              </div>
+
+              {TIPI_PAGINA[p.tipo].filtro === "centri" && centri.length > 1 && (
+                <div style={{marginTop:10}}>
+                  <div style={{fontSize:12,color:"#94a3b8",marginBottom:6}}>{p.tipo === "cassa" ? "Articoli mostrati" : "Incassi conteggiati"}</div>
+                  <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                    <button onClick={()=>modifica(p.id,{centri:[]})} style={pill(!p.centri.length)}>Tutti i centri</button>
+                    {centri.map(c => <button key={c.id} onClick={()=>scambiaCentro(p,c.id)} style={pill(p.centri.includes(c.id))}>{etichetta(c)}</button>)}
+                  </div>
+                </div>
+              )}
+
+              {TIPI_PAGINA[p.tipo].filtro === "stazione" && (
+                <div style={{marginTop:10}}>
+                  <div style={{fontSize:12,color:"#94a3b8",marginBottom:6}}>Comande mostrate</div>
+                  <select aria-label="Stazione" value={p.stazione} onChange={e=>modifica(p.id,{stazione:e.target.value})} style={campo}>
+                    <option value="">Tutte le stazioni</option>
+                    {stazioni.map(st => <option key={st} value={st}>{st}</option>)}
+                    {p.stazione && !stazioni.includes(p.stazione) && <option value={p.stazione}>⚠️ {p.stazione} (non più usata)</option>}
+                  </select>
+                  {!stazioni.length && <div style={{fontSize:12,color:"#fbbf24",marginTop:6}}>Nessun centro invia comande: attivale nei centri di costo.</div>}
+                </div>
+              )}
+
+              {p.tipo === "impostazioni"
+                ? <div style={{fontSize:12,color:"#94a3b8",marginTop:10}}>Questa pagina non si può togliere.</div>
+                : <button onClick={()=>togli(p)} style={{...tasto,background:"#7f1d1d",color:"#fca5a5",marginTop:10}}>🗑 Togli pagina</button>}
+            </div>
+          )}
+        </div>
+      ))}
+
+      {tipiAggiungibili.length > 0 && (
+        <div style={{display:"flex",gap:8,marginTop:10}}>
+          <select aria-label="Tipo di pagina" value={tipiAggiungibili.includes(tipoNuovo)?tipoNuovo:tipiAggiungibili[0]} onChange={e=>setTipoNuovo(e.target.value)} style={campo}>
+            {tipiAggiungibili.map(t => <option key={t} value={t}>{TIPI_PAGINA[t].icona} {TIPI_PAGINA[t].nome}</option>)}
+          </select>
+          <button onClick={aggiungi} style={{...tasto,background:"#15803d",flexShrink:0,padding:"0 14px"}}>➕ Aggiungi</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+const descriviPagina = (p, centri) => {
+  const f = TIPI_PAGINA[p.tipo].filtro;
+  if (f === "stazione") return "Cucina · " + (p.stazione || "tutte le stazioni");
+  if (f === "centri") {
+    const nomi = centri.filter(c => p.centri.includes(c.id)).map(c => c.nome);
+    return TIPI_PAGINA[p.tipo].nome + " · " + (nomi.length ? nomi.join(" + ") : "tutti i centri");
+  }
+  return TIPI_PAGINA[p.tipo].nome;
+};
 
 /* ══ OPERAZIONI SUGLI EVENTI ══ */
 const conLimite = (promessa, ms) => Promise.race([promessa,
@@ -3553,19 +3758,21 @@ const elencoEventi = reg => {
 // Menu, centri e scontrino di un evento: mai ordini, comande o numerazione
 async function configEvento(id) {
   const prefisso = prefissoEvento(id), radice = radiceEvento(id), base = id === EVENTO_BASE;
-  let menu = null, centri = null, rcpt = null;
+  let menu = null, centri = null, rcpt = null, pagine = null;
   if (db) {
-    const letti = await conLimite(Promise.all(["menu", "config/centri", "config/scontrino"]
+    const letti = await conLimite(Promise.all(["menu", "config/centri", "config/scontrino", "config/pagine"]
       .map(p => db.ref(radice + "/" + p).once("value"))), 8000);
-    [menu, centri, rcpt] = letti.map(x => x.val());
+    [menu, centri, rcpt, pagine] = letti.map(x => x.val());
   }
   if (!Array.isArray(menu) || !menu.length) menu = jsonLocale(prefisso + "menu");
   if (!Array.isArray(centri) || !centri.length) centri = jsonLocale(prefisso + "centri");
   if (!rcpt || typeof rcpt !== "object") rcpt = jsonLocale(prefisso + "rcpt_cfg");
+  if (!Array.isArray(pagine) || !pagine.length) pagine = jsonLocale(prefisso + "pagine");
   return {
     menu:   Array.isArray(menu) ? menu : (base ? MENU_FESTIVAL : []),
     centri: fixCentri(Array.isArray(centri) && centri.length ? centri : (base ? CENTRI_FESTIVAL : CENTRI_EVENTO_NUOVO)),
     rcpt:   {...RCPT_FESTIVAL, ...(rcpt || (base ? {} : { sottotitolo:"" }))},
+    pagine: fixPagine(pagine),
   };
 }
 
@@ -3711,12 +3918,14 @@ function GestioneEventi({ registro, obbligatoria, carrelloPieno, onChiudi, onSce
           cfg.menu.length ? db.ref(radice + "/menu").set(cfg.menu) : Promise.resolve(),
           db.ref(radice + "/config/centri").set(cfg.centri),
           db.ref(radice + "/config/scontrino").set(rcpt),
+          db.ref(radice + "/config/pagine").set(cfg.pagine),
         ]), 8000);
       }
       const prefisso = prefissoEvento(id);
       localStorage.setItem(prefisso + "menu", JSON.stringify(cfg.menu));
       localStorage.setItem(prefisso + "centri", JSON.stringify(cfg.centri));
       localStorage.setItem(prefisso + "rcpt_cfg", JSON.stringify(rcpt));
+      localStorage.setItem(prefisso + "pagine", JSON.stringify(cfg.pagine));
     }
     // Il registro per ultimo: se qualcosa fallisce, l'evento non compare a metà
     await salvaVoce(id, voce);
