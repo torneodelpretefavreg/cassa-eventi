@@ -457,24 +457,21 @@ function Login({ onLogin }) {
 }
 
 /* ── POS ── */
-function POS({ theme, toggleTheme }) {
-  const [cart, setCart]     = useState([]);
-  const [view, setView]     = useState("cassa"); // cassa | carrello | scontrino | report | impostazioni
-  const [cat, setCat]       = useState("Tutti");
-  const [orders, setOrders] = useState(() => { try { return JSON.parse(localStorage.getItem(EVENT_PREFIX+"orders")||"[]"); } catch{return[];} });
-  const [lastR, setLastR]   = useState(null);
-  const [rcptIdx, setRcptIdx] = useState(0);
-  const [autoPrint, setAutoPrint] = useState(false);
+/* ══════════════════════════════════════════════════════════════
+   STRUTTURA DEL PROGRAMMA
+   POS           guscio: barra di navigazione e pagina attiva
+   useDatiEvento dati condivisi (ordini, comande, menu, centri, scontrino)
+   useStampa     scontrini a video, stampa e cassetto
+   useCassa      carrello e incasso: resta vivo cambiando pagina
+   PAGINE        registro di tutte le pagine (in fondo allo script)
+   Per aggiungere una pagina basta scrivere il componente e registrarlo.
+   ══════════════════════════════════════════════════════════════ */
 
-  useEffect(() => {
-    if (autoPrint && view === "scontrino" && lastR) {
-      const t = setTimeout(() => { window.print(); setAutoPrint(false); }, 500);
-      return () => clearTimeout(t);
-    }
-  }, [autoPrint, view, lastR, rcptIdx]);
+/* ── DATI DELL'EVENTO ── */
+function useDatiEvento() {
+  const [orders, setOrders] = useState(() => { try { return JSON.parse(localStorage.getItem(EVENT_PREFIX+"orders")||"[]"); } catch{return[];} });
   const [synced, setSynced] = useState(false);
   const [syncStatus, setSyncStatus] = useState("local"); // local | connected | error
-  const [processing, setProcessing] = useState(false); // blocca doppio incasso
 
   // Persistenza ordini su localStorage "throttled": evita di serializzare l'intera
   // lista in modo sincrono a ogni nuovo ordine (causa di blocchi sotto carico).
@@ -631,6 +628,28 @@ function POS({ theme, toggleTheme }) {
   };
   const resetRcptCfg = () => saveRcptCfg({...DEFAULT_RCPT});
 
+  // Con un solo centro di costo la suddivisione non serve a niente: la cassa
+  // torna a mostrare le sole categorie, e lo scontrino non stampa il reparto.
+  const modoSemplice = centri.length <= 1;
+
+  return { orders, setOrders, syncStatus, comande, menu, saveMenu, centri, saveCentri,
+           CATEGORIE, rcptCfg, saveRcptCfg, resetRcptCfg, modoSemplice };
+}
+
+/* ── SCONTRINI, STAMPA E CASSETTO ── */
+function useStampa(dati, view, setView) {
+  const { centri } = dati;
+  const [lastR, setLastR]   = useState(null);
+  const [rcptIdx, setRcptIdx] = useState(0);
+  const [autoPrint, setAutoPrint] = useState(false);
+
+  useEffect(() => {
+    if (autoPrint && view === "scontrino" && lastR) {
+      const t = setTimeout(() => { window.print(); setAutoPrint(false); }, 500);
+      return () => clearTimeout(t);
+    }
+  }, [autoPrint, view, lastR, rcptIdx]);
+
   // Scontrino finto per vedere l'effetto delle impostazioni senza incassare nulla
   const anteprimaScontrino = () => {
     const items = [
@@ -645,6 +664,69 @@ function POS({ theme, toggleTheme }) {
     setRcptIdx(0); setView("scontrino");
   };
 
+  // Apertura cassetto: la stampante (col cassetto collegato via RJ) va impostata
+  // per aprire il cassetto a ogni stampa. Questo invia una microstampa che fa
+  // scattare il kick. Funziona su tutti i dispositivi (iPhone/Android/PC).
+  const openDrawer = () => {
+    const html = document.documentElement;
+    html.classList.add("printing-drawer");
+    const cleanup = () => { html.classList.remove("printing-drawer"); window.removeEventListener("afterprint", cleanup); };
+    window.addEventListener("afterprint", cleanup);
+    setTimeout(() => { try { window.print(); } catch (e) {} }, 50);
+    setTimeout(cleanup, 4000); // fallback se "afterprint" non scatta (es. iOS)
+  };
+
+
+  // Stampa automatica in sequenza di tutti gli scontrini dell'ultimo ordine.
+  // window.print() è bloccante in modalità finestra di dialogo: dopo che torna,
+  // passiamo allo scontrino successivo. In modalità chiosco (stampa silenziosa)
+  // i lavori vengono accodati con un piccolo intervallo tra l'uno e l'altro.
+  // Stampa manuale del solo scontrino a video: rispetta le copie del suo centro,
+  // ma ne stampa comunque almeno una (il tasto è stato premuto apposta).
+  const printCurrent = (r) => {
+    const membri = r && r.gruppo ? centri.filter(c => c.gruppo === r.gruppo) : [];
+    const n = Math.max(1, copieGruppo(membri));
+    const step = (c) => {
+      try { window.print(); } catch (e) {}
+      if (c + 1 < n) setTimeout(() => step(c + 1), 400);
+    };
+    step(0);
+  };
+
+  // Costruisce la coda di stampa: ogni scontrino viene ripetuto tante volte
+  // quante ne prevede il suo centro di costo (0 = saltato del tutto).
+  // Ogni scontrino e' un lavoro di stampa a se': escono staccati, perche'
+  // BAR, CUCINA e PIZZA stanno in punti diversi.
+  const printAllReceipts = (receipts) => {
+    if (!receipts || !receipts.length) return;
+    const coda = [];
+    receipts.forEach((r, k) => {
+      const membri = r.gruppo ? centri.filter(c => c.gruppo === r.gruppo) : [];
+      const n = r.gruppo ? copieGruppo(membri) : 1;
+      for (let c = 0; c < n; c++) coda.push(k);
+    });
+    if (!coda.length) return;
+    const step = (i) => {
+      setRcptIdx(coda[i]);
+      setTimeout(() => {
+        try { window.print(); } catch (e) {}
+        if (i + 1 < coda.length) setTimeout(() => step(i + 1), 400);
+      }, 500); // attende il render del nuovo scontrino
+    };
+    step(0);
+  };
+
+  return { lastR, setLastR, rcptIdx, setRcptIdx, setAutoPrint,
+           anteprimaScontrino, openDrawer, printCurrent, printAllReceipts };
+}
+
+/* ── CASSA ── */
+function useCassa(dati, stampa, setView, isMobile) {
+  const { orders, setOrders, comande, menu, centri, CATEGORIE, rcptCfg, modoSemplice } = dati;
+  const { setLastR, setRcptIdx, printAllReceipts } = stampa;
+  const [cart, setCart]     = useState([]);
+  const [cat, setCat]       = useState("Tutti");
+  const [processing, setProcessing] = useState(false); // blocca doppio incasso
   const [search, setSearch] = useState("");
   const [pay, setPay]       = useState("contanti");
   const [disc, setDisc]     = useState(0);
@@ -654,19 +736,6 @@ function POS({ theme, toggleTheme }) {
   const [variantSel, setVariantSel] = useState([]);      // opzioni selezionate nel picker (multi-scelta)
   const [noteItem, setNoteItem] = useState(null);        // {item} - pizza per cui inserire una nota libera
   const [noteText, setNoteText] = useState("");          // testo della nota in corso di inserimento
-  /* Layout a schede (Menu / Carrello) solo quando la finestra e' STRETTA:
-     telefoni, tablet in verticale, finestre a mezzo schermo. Sui PC, anche
-     con schermo basso, resta il layout a due colonne: e' la CSS "compatta"
-     (vedi <style>) a rimpicciolire tutto, cosi' TOTALE e Incassa restano
-     sempre visibili qualunque sia lo zoom o la scalatura di Windows. */
-  const schermoStretto = () => window.innerWidth < 900;
-  const [isMobile, setIsMobile] = useState(schermoStretto());
-
-  useEffect(() => {
-    const h = () => setIsMobile(schermoStretto());
-    window.addEventListener("resize", h);
-    return () => window.removeEventListener("resize", h);
-  }, []);
 
   const subtotal = cart.reduce((s,i)=>s+i.price*i.qty,0);
   const discAmt  = subtotal*(disc/100);
@@ -737,58 +806,6 @@ function POS({ theme, toggleTheme }) {
   };
   const remItem = id => setCart(p=>{const e=p.find(i=>i.id===id);return e.qty===1?p.filter(i=>i.id!==id):p.map(i=>i.id===id?{...i,qty:i.qty-1}:i);});
   const clearCart = ()=>{setCart([]);setDisc(0);setTable("");};
-
-  // Apertura cassetto: la stampante (col cassetto collegato via RJ) va impostata
-  // per aprire il cassetto a ogni stampa. Questo invia una microstampa che fa
-  // scattare il kick. Funziona su tutti i dispositivi (iPhone/Android/PC).
-  const openDrawer = () => {
-    const html = document.documentElement;
-    html.classList.add("printing-drawer");
-    const cleanup = () => { html.classList.remove("printing-drawer"); window.removeEventListener("afterprint", cleanup); };
-    window.addEventListener("afterprint", cleanup);
-    setTimeout(() => { try { window.print(); } catch (e) {} }, 50);
-    setTimeout(cleanup, 4000); // fallback se "afterprint" non scatta (es. iOS)
-  };
-
-
-  // Stampa automatica in sequenza di tutti gli scontrini dell'ultimo ordine.
-  // window.print() è bloccante in modalità finestra di dialogo: dopo che torna,
-  // passiamo allo scontrino successivo. In modalità chiosco (stampa silenziosa)
-  // i lavori vengono accodati con un piccolo intervallo tra l'uno e l'altro.
-  // Stampa manuale del solo scontrino a video: rispetta le copie del suo centro,
-  // ma ne stampa comunque almeno una (il tasto è stato premuto apposta).
-  const printCurrent = (r) => {
-    const membri = r && r.gruppo ? centri.filter(c => c.gruppo === r.gruppo) : [];
-    const n = Math.max(1, copieGruppo(membri));
-    const step = (c) => {
-      try { window.print(); } catch (e) {}
-      if (c + 1 < n) setTimeout(() => step(c + 1), 400);
-    };
-    step(0);
-  };
-
-  // Costruisce la coda di stampa: ogni scontrino viene ripetuto tante volte
-  // quante ne prevede il suo centro di costo (0 = saltato del tutto).
-  // Ogni scontrino e' un lavoro di stampa a se': escono staccati, perche'
-  // BAR, CUCINA e PIZZA stanno in punti diversi.
-  const printAllReceipts = (receipts) => {
-    if (!receipts || !receipts.length) return;
-    const coda = [];
-    receipts.forEach((r, k) => {
-      const membri = r.gruppo ? centri.filter(c => c.gruppo === r.gruppo) : [];
-      const n = r.gruppo ? copieGruppo(membri) : 1;
-      for (let c = 0; c < n; c++) coda.push(k);
-    });
-    if (!coda.length) return;
-    const step = (i) => {
-      setRcptIdx(coda[i]);
-      setTimeout(() => {
-        try { window.print(); } catch (e) {}
-        if (i + 1 < coda.length) setTimeout(() => step(i + 1), 400);
-      }, 500); // attende il render del nuovo scontrino
-    };
-    step(0);
-  };
 
   const checkout = () => {
     if (!cart.length) return;
@@ -925,69 +942,6 @@ function POS({ theme, toggleTheme }) {
     }
   };
 
-  // === FUNZIONI COMANDE (Cucina) ===
-  const toggleComandaItem = (comanda, itemUid) => {
-    const newItems = comanda.items.map(it =>
-      it.uid === itemUid ? {...it, done: !it.done} : it
-    );
-    // NB: spuntare tutte le voci NON archivia più la comanda in automatico.
-    // La comanda resta in lavorazione finché non viene eliminata/archiviata a mano.
-    if (db && comanda._key) db.ref(DB_ROOT+"/comande/" + comanda._key).update({ items: newItems });
-  };
-
-  const consegnaScontrino = (comanda) => {
-    if (db && comanda._key) db.ref(DB_ROOT+"/comande/" + comanda._key).update({ stato: "lavorazione" });
-  };
-
-  const evadiComanda = (comanda) => {
-    const newItems = comanda.items.map(it => ({...it, done: true}));
-    if (db && comanda._key) db.ref(DB_ROOT+"/comande/" + comanda._key).update({ items: newItems, evasa: true, stato: "evasa" });
-  };
-
-  const svuotaStorico = () => {
-    const evase = comande.filter(c => c.evasa || c.stato === "evasa");
-    if (!evase.length) { alert("Lo storico è già vuoto."); return; }
-    if (!window.confirm("Eliminare tutte le " + evase.length + " comande evase dallo storico? Non si può annullare.")) return;
-    if (db) evase.forEach(c => { if (c._key) db.ref(DB_ROOT+"/comande/" + c._key).remove(); });
-  };
-
-  const deleteComanda = (comanda) => {
-    if (!window.confirm("Eliminare definitivamente la comanda di " + comanda.cliente + "?")) return;
-    if (db && comanda._key) db.ref(DB_ROOT+"/comande/" + comanda._key).remove();
-  };
-
-  // Sposta una comanda (da attesa o lavorazione) direttamente nello storico
-  const archiviaComanda = (comanda) => {
-    if (!window.confirm("Spostare la comanda di " + comanda.cliente + " nello storico?")) return;
-    if (db && comanda._key) db.ref(DB_ROOT+"/comande/" + comanda._key).update({ stato: "evasa", evasa: true });
-  };
-
-  // Riporta una comanda dallo storico allo stato "in attesa" (azzera le spunte)
-  const riportaInAttesa = (comanda) => {
-    if (db && comanda._key) {
-      const resetItems = (comanda.items || []).map(it => ({ ...it, done: false }));
-      db.ref(DB_ROOT+"/comande/" + comanda._key).update({ stato: "attesa", evasa: false, items: resetItems });
-    }
-  };
-
-  const deleteAllOrders = () => {
-    if (!window.confirm("Eliminare tutti i dati? Non si può annullare.")) return;
-    if (db) { db.ref(DB_ROOT+"/orders").remove(); }
-    setOrders([]);
-    localStorage.removeItem(EVENT_PREFIX+"orders");
-  };
-
-  const deleteOrder = (order) => {
-    if (!window.confirm("Annullare lo scontrino N." + String(order.id).padStart(4,"0") + "?")) return;
-    if (db && order._key) {
-      db.ref(DB_ROOT+"/orders/" + order._key).remove();
-    } else {
-      const no = orders.filter(o => o.id !== order.id);
-      setOrders(no);
-      localStorage.setItem(EVENT_PREFIX+"orders", JSON.stringify(no));
-    }
-  };
-
   const editOrder = (order) => {
     if (!window.confirm("Modificare lo scontrino N." + String(order.id).padStart(4,"0") + "? Verrà riaperto nel carrello e lo scontrino originale sarà eliminato.")) return;
     // Load items into cart
@@ -1009,9 +963,6 @@ function POS({ theme, toggleTheme }) {
   /* Filtro a due livelli: prima i centri di costo (pochi tasti grandi), poi,
      solo se il centro ha più categorie, la riga delle sue categorie.
      cat vale "Tutti" | "c:<idCentro>" | "<nome categoria>" */
-  // Con un solo centro di costo la suddivisione non serve a niente: la cassa
-  // torna a mostrare le sole categorie, e lo scontrino non stampa il reparto.
-  const modoSemplice = centri.length <= 1;
   const catsConArticoli = React.useMemo(
     () => CATEGORIE.filter(c => menu.some(i => i.cat === c)), [CATEGORIE, menu]);
   const centriConArticoli = React.useMemo(
@@ -1072,15 +1023,411 @@ function POS({ theme, toggleTheme }) {
     if (cat !== "Tutti" && !centroSelezionato && !menu.some(i => i.cat === cat)) setCat("Tutti");
   }, [centri, menu]);
 
+  return { cart, cat, setCat, processing, search, setSearch, pay, setPay, disc, setDisc,
+           table, setTable, flash, variantPick, setVariantPick, variantSel, setVariantSel,
+           noteItem, setNoteItem, noteText, setNoteText, subtotal, discAmt, total, cartCount,
+           addItem, confirmNote, toggleVariant, confirmVariants, remItem, clearCart, checkout,
+           editOrder, catsConArticoli, centriConArticoli, centroSelezionato, sottoCategorie,
+           filtered, gruppiGriglia };
+}
+
+/* ── MODALI DELLA CASSA (varianti e nota) ── */
+function ModaliCassa({ cassa }) {
+  const { variantPick, setVariantPick, variantSel, setVariantSel, noteItem, setNoteItem,
+          noteText, setNoteText, toggleVariant, confirmVariants, confirmNote } = cassa;
+  // Modale per inserire una nota libera sulla pizza (condivisa mobile + desktop)
+  const noteModalJSX = noteItem && (
+    <div onClick={()=>{setNoteItem(null);setNoteText("");}} style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.75)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
+      <div onClick={e=>e.stopPropagation()} style={{background:"#1e293b",border:"1px solid #334155",borderRadius:16,padding:20,maxWidth:380,width:"100%",maxHeight:"calc(var(--app-h, 100dvh) - 28px)",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,0.5)"}}>
+        <div style={{fontSize:18,fontWeight:800,color:"#f8fafc",marginBottom:6,letterSpacing:"-0.3px"}}>🍕 {noteItem.name}</div>
+        <div style={{fontSize:13,color:"#94a3b8",marginBottom:14}}>Aggiungi una nota per la cucina (es. senza cipolla, base bianca…). Lascia vuoto se non serve.</div>
+        {noteItem.variants && noteItem.variants.length > 0 && (
+          <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:12}}>
+            {noteItem.variants.map(v => (
+              <button key={v} onClick={()=>setNoteText(t => t ? t+", "+v : v)} style={{background:"#0f172a",border:"1px solid #334155",color:"#e2e8f0",padding:"6px 10px",borderRadius:16,cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>+ {v}</button>
+            ))}
+          </div>
+        )}
+        <textarea value={noteText} onChange={e=>setNoteText(e.target.value)} autoFocus rows={3} placeholder="Es. senza cipolla" style={{width:"100%",background:"#0f172a",border:"1px solid #334155",color:"#e2e8f0",padding:"12px",borderRadius:10,fontSize:15,fontFamily:"inherit",outline:"none",resize:"vertical",boxSizing:"border-box"}} />
+        <div style={{display:"flex",gap:10,marginTop:16}}>
+          <button onClick={()=>{setNoteItem(null);setNoteText("");}} style={{flex:1,background:"transparent",border:"1px solid #334155",color:"#94a3b8",padding:"12px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:14}}>Annulla</button>
+          <button onClick={confirmNote} style={{flex:2,background:"#dc2626",border:"none",color:"#fff",padding:"12px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:15,fontWeight:700}}>✓ Aggiungi</button>
+        </div>
+      </div>
+    </div>
+  );
+
+  return (
+    <>
+    {variantPick && (
+      <div onClick={()=>setVariantPick(null)} style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.75)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
+        <div onClick={e=>e.stopPropagation()} style={{background:"#1e293b",border:"1px solid #334155",borderRadius:16,padding:20,maxWidth:380,width:"100%",maxHeight:"calc(var(--app-h, 100dvh) - 28px)",display:"flex",flexDirection:"column",boxShadow:"0 20px 60px rgba(0,0,0,0.5)"}}>
+          <div style={{fontSize:18,fontWeight:800,color:"#f8fafc",marginBottom:6,letterSpacing:"-0.3px",flexShrink:0}}>{variantPick.name}</div>
+          <div style={{fontSize:13,color:"#94a3b8",marginBottom:16,flexShrink:0}}>Scegli le opzioni — puoi selezionarne più di una, poi premi Fatto</div>
+          <div style={{display:"flex",flexDirection:"column",gap:10,overflowY:"auto",minHeight:0,flex:"1 1 auto",margin:"0 -4px",padding:"4px"}}>
+            {variantPick.variants.map(v => {
+              const on = variantSel.includes(v);
+              return (
+                <button key={v} onClick={()=>toggleVariant(v)} style={{background:on?"#7f1d1d":"#0f172a",border:"1px solid "+(on?"#dc2626":"#334155"),color:on?"#fff":"#e2e8f0",padding:"14px 16px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:15,fontWeight:600,textAlign:"left",display:"flex",alignItems:"center",justifyContent:"space-between",gap:10}}>
+                  <span>{v}</span>
+                  <span style={{fontSize:16,opacity:on?1:0.3}}>{on?"\u2713":"\u25cb"}</span>
+                </button>
+              );
+            })}
+          </div>
+          <div style={{display:"flex",gap:10,marginTop:16,flexShrink:0}}>
+            <button onClick={()=>{setVariantPick(null);setVariantSel([]);}} style={{flex:1,background:"transparent",border:"1px solid #334155",color:"#94a3b8",padding:"12px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:14}}>
+              Annulla
+            </button>
+            <button onClick={confirmVariants} style={{flex:2,background:"#dc2626",border:"none",color:"#fff",padding:"12px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:15,fontWeight:700}}>
+              {"\u2713 Fatto"}{variantSel.length>0?" ("+variantSel.length+")":""}
+            </button>
+          </div>
+        </div>
+      </div>
+    )}
+      {noteModalJSX}
+    </>
+  );
+}
+
+/* ── PAGINA CASSA ── */
+function PaginaCassa({ dati, cassa, stampa, view, setView, isMobile }) {
+  const { modoSemplice } = dati;
+  const { openDrawer } = stampa;
+  const { cart, cat, setCat, processing, search, setSearch, pay, setPay, disc, setDisc,
+          table, setTable, subtotal, discAmt, total, cartCount, addItem, remItem, clearCart,
+          checkout, catsConArticoli, centriConArticoli, centroSelezionato, sottoCategorie,
+          filtered, gruppiGriglia } = cassa;
+
+  if (isMobile) return (
+    <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minHeight:0}}>
+
+      {/* Tab switcher: Menù / Carrello */}
+      <div style={{display:"flex",background:"#0f172a",borderBottom:"1px solid #334155",flexShrink:0}}>
+        <button onClick={()=>setView("cassa")} style={{flex:1,padding:"10px",background:view==="cassa"?"#1e293b":"transparent",border:"none",color:view==="cassa"?"#f8fafc":"#64748b",fontFamily:"inherit",fontSize:13,fontWeight:700,borderBottom:view==="cassa"?"2px solid #dc2626":"2px solid transparent",cursor:"pointer"}}>
+          🍽 Menù
+        </button>
+        <button onClick={()=>setView("carrello")} style={{flex:1,padding:"10px",background:view==="carrello"?"#1e293b":"transparent",border:"none",color:view==="carrello"?"#f8fafc":"#64748b",fontFamily:"inherit",fontSize:13,fontWeight:700,borderBottom:view==="carrello"?"2px solid #dc2626":"2px solid transparent",cursor:"pointer",position:"relative"}}>
+          🛒 Carrello {cartCount>0&&<span style={{background:"#dc2626",color:"#fff",borderRadius:10,padding:"1px 7px",fontSize:11,marginLeft:4}}>{cartCount}</span>}
+        </button>
+      </div>
+
+      {/* MENÙ TAB */}
+      {view==="cassa" && (
+        <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minHeight:0}}>
+          {/* Search */}
+          <div style={{padding:"8px 10px",flexShrink:0,display:"flex",gap:8}}>
+            <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="🔍 Cerca..." style={{flex:1,minWidth:0,background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"10px 14px",borderRadius:10,fontSize:14,fontFamily:"inherit",outline:"none"}} />
+            <button onClick={openDrawer} title="Apri cassetto" style={{flexShrink:0,width:48,background:"#334155",border:"1px solid #475569",color:"#fff",borderRadius:10,cursor:"pointer",fontSize:20}}>💶</button>
+          </div>
+          {/* Category pills */}
+          <div style={{display:"flex",gap:6,padding:"0 10px 8px",overflowX:"auto",flexShrink:0,scrollbarWidth:"none"}}>
+            <button onClick={()=>setCat("Tutti")} style={{background:cat==="Tutti"?"#dc2626":"#1e293b",border:`1px solid ${cat==="Tutti"?"#dc2626":"#334155"}`,color:cat==="Tutti"?"#fff":"#94a3b8",padding:"8px 14px",borderRadius:20,cursor:"pointer",fontSize:12,fontWeight:700,fontFamily:"inherit",whiteSpace:"nowrap",flexShrink:0}}>
+              🔍 Tutti
+            </button>
+            {modoSemplice && catsConArticoli.map(c=>(
+              <button key={c} onClick={()=>setCat(c)} style={{background:cat===c?"#dc2626":"#1e293b",border:`1px solid ${cat===c?"#dc2626":"#334155"}`,color:cat===c?"#fff":"#94a3b8",padding:"8px 14px",borderRadius:20,cursor:"pointer",fontSize:12,fontWeight:700,fontFamily:"inherit",whiteSpace:"nowrap",flexShrink:0}}>
+                {c}
+              </button>
+            ))}
+            {!modoSemplice && centriConArticoli.map(c=>{
+              const on = centroSelezionato && centroSelezionato.id === c.id;
+              return (
+                <button key={c.id} onClick={()=>setCat("c:"+c.id)} style={{background:on?"#dc2626":"#1e293b",border:`1px solid ${on?"#dc2626":"#334155"}`,color:on?"#fff":"#94a3b8",padding:"8px 14px",borderRadius:20,cursor:"pointer",fontSize:12,fontWeight:700,fontFamily:"inherit",whiteSpace:"nowrap",flexShrink:0}}>
+                  <span style={{fontSize:15,marginRight:5}}>{c.emoji}</span>{c.nome}
+                </button>
+              );
+            })}
+          </div>
+          {!modoSemplice && sottoCategorie.length > 0 && (
+            <div style={{display:"flex",gap:6,padding:"0 10px 8px",overflowX:"auto",flexShrink:0,scrollbarWidth:"none"}}>
+              <button onClick={()=>setCat("c:"+centroSelezionato.id)} style={{background:String(cat).startsWith("c:")?"#7f1d1d":"transparent",border:"1px solid #334155",color:String(cat).startsWith("c:")?"#fff":"#64748b",padding:"5px 12px",borderRadius:16,cursor:"pointer",fontSize:11,fontFamily:"inherit",whiteSpace:"nowrap",flexShrink:0}}>
+                Tutto {centroSelezionato.nome}
+              </button>
+              {sottoCategorie.map(sc=>(
+                <button key={sc} onClick={()=>setCat(sc)} style={{background:cat===sc?"#7f1d1d":"transparent",border:`1px solid ${cat===sc?"#dc2626":"#334155"}`,color:cat===sc?"#fff":"#64748b",padding:"5px 12px",borderRadius:16,cursor:"pointer",fontSize:11,fontFamily:"inherit",whiteSpace:"nowrap",flexShrink:0}}>
+                  {sc}
+                </button>
+              ))}
+            </div>
+          )}
+          {/* Product grid */}
+          <div style={{padding:"0 10px 10px",overflowY:"auto",flex:1,minHeight:0}}>
+            {!filtered.length && <div style={{textAlign:"center",color:"#475569",padding:"30px 0",fontSize:14}}>Nessun articolo</div>}
+            {gruppiGriglia.map(g=>(
+              <div key={g.key} style={{marginBottom:14}}>
+                {g.titolo && (
+                  <div style={{display:"flex",alignItems:"center",gap:8,margin:"6px 2px 8px"}}>
+                    <div style={{fontSize:12,fontWeight:800,color:"#94a3b8",letterSpacing:0.4,whiteSpace:"nowrap"}}>{g.titolo}</div>
+                    <div style={{flex:1,height:1,background:"#1e293b"}}/>
+                    <div style={{fontSize:11,color:"#475569"}}>{g.items.length}</div>
+                  </div>
+                )}
+                <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(104px,1fr))",gap:8}}>
+                  {g.items.map(item=>(
+                    <button key={item.id} onClick={()=>addItem(item)} className="prod-tile" style={{background:"#1e293b",border:"1px solid #334155",borderRadius:12,padding:"14px 8px",cursor:"pointer",textAlign:"center",color:"#e2e8f0",fontFamily:"inherit",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:4,minHeight:72}}>
+                      <div style={{fontSize:12,fontWeight:700,lineHeight:1.25,color:"#f1f5f9"}}>{item.name}</div>
+                      <div style={{fontSize:16,color:"#f87171",fontWeight:900,marginTop:3}}>{fmt(item.price)}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* CARRELLO TAB */}
+      {view==="carrello" && (
+        <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minHeight:0}}>
+          {/* Table input */}
+          <div className="cart-head" style={{padding:"8px 10px",flexShrink:0}}>
+            <input value={table} onChange={e=>setTable(e.target.value)} placeholder="👤 Nome cliente (solo se c'è cibo)" style={{width:"100%",background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"10px 14px",borderRadius:10,fontSize:14,fontFamily:"inherit",outline:"none"}} />
+          </div>
+          {/* Cart items */}
+          <div className="scroll-y" style={{flex:"1 1 0",minHeight:0,padding:"0 10px"}}>
+            {!cart.length && (
+              <div style={{textAlign:"center",color:"#475569",padding:"40px 0",fontSize:15}}>
+                Nessun articolo<br/><span style={{fontSize:36}}>🛒</span>
+              </div>
+            )}
+            {cart.map(item=>(
+              <div key={item.id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 0",borderBottom:"1px solid #1e293b"}}>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:13,color:"#e2e8f0",fontWeight:600}}>{item.name}</div>
+                  {item.note && <div style={{fontSize:11,color:"#fbbf24",fontStyle:"italic",marginTop:2}}>📝 {item.note}</div>}
+                </div>
+                <button onClick={()=>remItem(item.id)} style={{background:"#334155",border:"none",color:"#e2e8f0",width:32,height:32,borderRadius:8,cursor:"pointer",fontSize:18,fontFamily:"inherit"}}>−</button>
+                <span style={{width:24,textAlign:"center",fontWeight:900,fontSize:16}}>{item.qty}</span>
+                <button onClick={()=>addItem(item)} style={{background:"#334155",border:"none",color:"#e2e8f0",width:32,height:32,borderRadius:8,cursor:"pointer",fontSize:18,fontFamily:"inherit"}}>+</button>
+                <div style={{fontSize:14,fontWeight:900,color:"#f87171",minWidth:55,textAlign:"right"}}>{fmt(item.price*item.qty)}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Footer con totale e pagamento */}
+          {cart.length>0 && (
+            <div className="cart-footer" style={{background:"#131f30",borderTop:"1px solid #334155",padding:"10px 14px",paddingBottom:"calc(10px + env(safe-area-inset-bottom))",flexShrink:0,maxHeight:"64%",overflowY:"auto",display:"flex",flexDirection:"column"}}>
+              {/* Sconto */}
+              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8,flexShrink:0}}>
+                <span style={{color:"#94a3b8",fontSize:13}}>Sconto %</span>
+                <input type="number" min="0" max="100" value={disc} onChange={e=>setDisc(Math.min(100,Math.max(0,+e.target.value)))} style={{background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"4px 8px",borderRadius:6,width:64,textAlign:"center",fontSize:14,fontFamily:"inherit",outline:"none"}} />
+              </div>
+              {disc>0&&<div style={{display:"flex",justifyContent:"space-between",fontSize:13,color:"#94a3b8",marginBottom:4}}><span>Subtotale</span><span>{fmt(subtotal)}</span></div>}
+              {disc>0&&<div style={{display:"flex",justifyContent:"space-between",fontSize:13,color:"#f87171",marginBottom:4}}><span>Sconto -{disc}%</span><span>−{fmt(discAmt)}</span></div>}
+              <div className="cart-tot" style={{display:"flex",justifyContent:"space-between",fontSize:22,fontWeight:900,color:"#4ade80",marginBottom:12,flexShrink:0}}>
+                <span>TOTALE</span><span>{fmt(total)}</span>
+              </div>
+              {/* Payment methods */}
+              <div className="pay-grid" style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10,flexShrink:0}}>
+                {PAGAMENTI.map(([m,ic])=>(
+                  <button key={m} onClick={()=>setPay(m)} style={{background:pay===m?"#991b1b":"#1e293b",border:`2px solid ${pay===m?"#dc2626":"#334155"}`,color:pay===m?"#fff":"#94a3b8",padding:"10px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:13,fontWeight:700,textTransform:"capitalize"}}>
+                    {ic} {m}
+                  </button>
+                ))}
+              </div>
+              {/* Actions — sticky in fondo: sempre visibili */}
+              <div className="act-bar" style={{display:"flex",gap:8,flexShrink:0,background:"#131f30",paddingTop:4}}>
+                <button onClick={clearCart} style={{flex:1,background:"#7f1d1d",border:"none",color:"#fca5a5",padding:"13px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>
+                  🗑 Cancella
+                </button>
+                <button onClick={checkout} disabled={processing} style={{flex:2,background:processing?"#166534":"#15803d",border:"none",color:"#fff",padding:"13px",borderRadius:10,cursor:processing?"wait":"pointer",opacity:processing?0.6:1,fontFamily:"inherit",fontSize:15,fontWeight:900}}>
+                  {processing ? "⏳ Attendi…" : <>✅ Incassa {fmt(total)}</>}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+
+  return (
+    <div style={{display:"flex",flex:1,minHeight:0,overflow:"hidden"}}>
+      <div style={{flex:1,display:"flex",flexDirection:"column",padding:16,overflow:"hidden",borderRight:"1px solid #1e293b",gap:10}}>
+        <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="🔍 Cerca prodotto..." style={{width:"100%",background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"8px 14px",borderRadius:8,fontSize:14,fontFamily:"inherit",outline:"none"}} />
+        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+          <button onClick={()=>setCat("Tutti")} style={{background:cat==="Tutti"?"#dc2626":"#1e293b",border:`1px solid ${cat==="Tutti"?"#dc2626":"#334155"}`,color:cat==="Tutti"?"#fff":"#94a3b8",padding:"6px 14px",borderRadius:20,cursor:"pointer",fontSize:13,fontWeight:700,fontFamily:"inherit"}}>🔍 Tutti</button>
+          {modoSemplice && catsConArticoli.map(c=>(
+            <button key={c} onClick={()=>setCat(c)} style={{background:cat===c?"#dc2626":"#1e293b",border:`1px solid ${cat===c?"#dc2626":"#334155"}`,color:cat===c?"#fff":"#94a3b8",padding:"6px 14px",borderRadius:20,cursor:"pointer",fontSize:13,fontWeight:700,fontFamily:"inherit"}}>{c}</button>
+          ))}
+          {!modoSemplice && centriConArticoli.map(c=>{
+            const on = centroSelezionato && centroSelezionato.id === c.id;
+            return (
+              <button key={c.id} onClick={()=>setCat("c:"+c.id)} style={{background:on?"#dc2626":"#1e293b",border:`1px solid ${on?"#dc2626":"#334155"}`,color:on?"#fff":"#94a3b8",padding:"6px 14px",borderRadius:20,cursor:"pointer",fontSize:13,fontWeight:700,fontFamily:"inherit"}}>
+                <span style={{fontSize:15,marginRight:5}}>{c.emoji}</span>{c.nome}
+              </button>
+            );
+          })}
+        </div>
+        {!modoSemplice && sottoCategorie.length > 0 && (
+          <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+            <button onClick={()=>setCat("c:"+centroSelezionato.id)} style={{background:String(cat).startsWith("c:")?"#7f1d1d":"transparent",border:"1px solid #334155",color:String(cat).startsWith("c:")?"#fff":"#64748b",padding:"4px 12px",borderRadius:16,cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>Tutto {centroSelezionato.nome}</button>
+            {sottoCategorie.map(sc=>(
+              <button key={sc} onClick={()=>setCat(sc)} style={{background:cat===sc?"#7f1d1d":"transparent",border:`1px solid ${cat===sc?"#dc2626":"#334155"}`,color:cat===sc?"#fff":"#64748b",padding:"4px 12px",borderRadius:16,cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>{sc}</button>
+            ))}
+          </div>
+        )}
+        <div className="scroll-y" style={{flex:"1 1 0"}}>
+          {!filtered.length && <div style={{textAlign:"center",color:"#475569",padding:"40px 0",fontSize:15}}>Nessun articolo</div>}
+          {gruppiGriglia.map(g=>(
+            <div key={g.key} style={{marginBottom:18}}>
+              {g.titolo && (
+                <div style={{display:"flex",alignItems:"center",gap:10,margin:"4px 2px 10px"}}>
+                  <div style={{fontSize:13,fontWeight:800,color:"#94a3b8",letterSpacing:0.4,whiteSpace:"nowrap"}}>{g.titolo}</div>
+                  <div style={{flex:1,height:1,background:"#1e293b"}}/>
+                  <div style={{fontSize:11,color:"#475569"}}>{g.items.length}</div>
+                </div>
+              )}
+              <div className="prod-grid" style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(130px,1fr))",gap:10}}>
+                {g.items.map(item=>(
+                  <button key={item.id} onClick={()=>addItem(item)} className="prod-tile" style={{background:"#1e293b",border:"1px solid #334155",borderRadius:10,padding:"14px 10px",cursor:"pointer",textAlign:"center",color:"#e2e8f0",fontFamily:"inherit"}}>
+                    <div style={{fontSize:12,fontWeight:600,marginBottom:6,lineHeight:1.3}}>{item.name}</div>
+                    <div style={{fontSize:15,color:"#f87171",fontWeight:800}}>{fmt(item.price)}</div>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div className="cart-col" style={{width:"clamp(272px, 26vw, 360px)",flexShrink:0,background:"#131f30"}}>
+        <div className="cart-head" style={{padding:"14px 16px 10px",borderBottom:"1px solid #1e293b",flexShrink:0}}>
+          <span style={{fontSize:18,fontWeight:800,color:"#f8fafc"}}>🛒 Ordine</span>
+          <input value={table} onChange={e=>setTable(e.target.value)} placeholder="Nome cliente (solo se c'è cibo)" style={{width:"100%",background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"6px 10px",borderRadius:6,fontSize:13,fontFamily:"inherit",outline:"none",marginTop:8}} />
+        </div>
+        <div className="scroll-y" style={{flex:"1 1 0",minHeight:0,padding:"8px 12px"}}>
+          {!cart.length&&<div style={{textAlign:"center",color:"#475569",padding:"40px 0",fontSize:15}}>Nessun articolo<br/><span style={{fontSize:32}}>🛒</span></div>}
+          {cart.map(item=>(
+            <div key={item.id} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0",borderBottom:"1px solid #1e293b"}}>
+              <div style={{flex:1,lineHeight:1.3}}>
+                <div style={{fontSize:12,color:"#cbd5e1"}}>{item.name}</div>
+                {item.note && <div style={{fontSize:11,color:"#fbbf24",fontStyle:"italic",marginTop:2}}>📝 {item.note}</div>}
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:4}}>
+                <button onClick={()=>remItem(item.id)} style={{background:"#334155",border:"none",color:"#e2e8f0",width:26,height:26,borderRadius:6,cursor:"pointer",fontSize:16,fontFamily:"inherit"}}>−</button>
+                <span style={{width:22,textAlign:"center",fontWeight:700,fontSize:14}}>{item.qty}</span>
+                <button onClick={()=>addItem(item)} style={{background:"#334155",border:"none",color:"#e2e8f0",width:26,height:26,borderRadius:6,cursor:"pointer",fontSize:16,fontFamily:"inherit"}}>+</button>
+              </div>
+              <div style={{fontSize:14,fontWeight:700,color:"#f87171",minWidth:60,textAlign:"right"}}>{fmt(item.price*item.qty)}</div>
+            </div>
+          ))}
+        </div>
+        <div className="cart-footer" style={{padding:"10px 14px calc(10px + env(safe-area-inset-bottom))",borderTop:"1px solid #1e293b",flexShrink:0,background:"#131f30",maxHeight:"62%",overflowY:"auto",display:"flex",flexDirection:"column"}}>
+          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6,flexShrink:0}}>
+            <span style={{color:"#94a3b8",fontSize:13}}>Sconto %</span>
+            <input type="number" min="0" max="100" value={disc} onChange={e=>setDisc(Math.min(100,Math.max(0,+e.target.value)))} style={{background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"4px 8px",borderRadius:6,width:60,textAlign:"center",fontSize:14,fontFamily:"inherit",outline:"none"}} />
+          </div>
+          {disc>0&&<div style={{display:"flex",justifyContent:"space-between",padding:"4px 0",fontSize:14}}><span style={{color:"#94a3b8"}}>Subtotale</span><span>{fmt(subtotal)}</span></div>}
+          {disc>0&&<div style={{display:"flex",justifyContent:"space-between",padding:"4px 0",fontSize:14}}><span style={{color:"#f87171"}}>Sconto -{disc}%</span><span style={{color:"#f87171"}}>−{fmt(discAmt)}</span></div>}
+          <div className="cart-tot" style={{display:"flex",justifyContent:"space-between",padding:"4px 0",fontSize:22,fontWeight:900,color:"#4ade80",margin:"8px 0",flexShrink:0}}><span>TOTALE</span><span>{fmt(total)}</span></div>
+          <div className="pay-grid" style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,margin:"10px 0",flexShrink:0}}>
+            {PAGAMENTI.map(([m,ic])=>(
+              <button key={m} onClick={()=>setPay(m)} style={{background:pay===m?"#991b1b":"#1e293b",border:`1px solid ${pay===m?"#dc2626":"#334155"}`,color:pay===m?"#fff":"#94a3b8",padding:"7px 4px",borderRadius:8,cursor:"pointer",fontSize:12,fontFamily:"inherit",textTransform:"capitalize"}}>{ic} {m}</button>
+            ))}
+          </div>
+          {/* Barra azioni: sta DENTRO la colonna (niente position:fixed) ed
+              e' sticky in fondo. Cosi' il tasto Incassa resta sempre
+              visibile e cliccabile su qualunque schermo, zoom o scalatura. */}
+          <div className="act-bar" style={{display:"flex",gap:8,flexShrink:0,paddingTop:4,background:"#131f30"}}>
+            <button onClick={clearCart} style={{flex:1,background:"#7f1d1d",border:"none",color:"#fca5a5",padding:"11px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:13}}>🗑 Cancella</button>
+            <button onClick={checkout} disabled={!cart.length || processing} style={{flex:2,background:processing?"#166534":"#15803d",border:"none",color:"#fff",padding:"11px",borderRadius:8,cursor:processing?"wait":"pointer",opacity:processing?0.6:1,fontFamily:"inherit",fontSize:14,fontWeight:800}}>{processing ? "⏳ Attendi…" : <>✅ Incassa {fmt(total)}</>}</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── PAGINA SCONTRINO ── */
+function PaginaScontrino({ dati, stampa, setView, isMobile }) {
+  const { rcptCfg } = dati;
+  const { lastR, rcptIdx, setRcptIdx, setAutoPrint, printCurrent } = stampa;
+  if (!lastR) return null;
+  const receipts = Array.isArray(lastR) ? lastR : [lastR];
+  const r = receipts[rcptIdx];
+  const isLast = rcptIdx >= receipts.length - 1;
+  const hasMultiple = receipts.length > 1;
+
+  if (isMobile) return (
+    <div style={{flex:1,overflowY:"auto",padding:16,display:"flex",flexDirection:"column",alignItems:"center"}}>
+      {hasMultiple && (
+        <div style={{width:"100%",maxWidth:320,marginBottom:12,display:"flex",gap:6}}>
+          {receipts.map((rec,i)=>(
+            <button key={i} onClick={()=>setRcptIdx(i)} style={{flex:1,padding:"8px",borderRadius:8,border:"none",cursor:"pointer",fontFamily:"inherit",fontSize:12,fontWeight:700,background:rcptIdx===i?"#dc2626":"#334155",color:"#fff"}}>
+              {rec.centro}
+            </button>
+          ))}
+        </div>
+      )}
+      <div id="receipt-print" style={{background:"#fff",color:"#000",width:"100%",maxWidth:320,padding:20,borderRadius:8,fontFamily:"'JetBrains Mono','Courier New',monospace",fontSize:rcptCfg.fontBase,fontWeight:700}}>
+        <ReceiptBody r={r} cfg={rcptCfg} />
+      </div>
+      <div style={{display:"flex",gap:10,marginTop:16,width:"100%",maxWidth:320}}>
+        <button onClick={()=>printCurrent(r)} style={{flex:1,background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"13px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>🖨 Stampa</button>
+        {!isLast
+          ? <button onClick={()=>{setRcptIdx(rcptIdx+1);setAutoPrint(true);}} style={{flex:2,background:"#dc2626",border:"none",color:"#fff",padding:"13px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:900}}>Prossimo →</button>
+          : <button onClick={()=>setView("cassa")} style={{flex:2,background:"#15803d",border:"none",color:"#fff",padding:"13px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:900}}>➕ Nuovo Ordine</button>
+        }
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{display:"flex",flexDirection:"column",alignItems:"center",padding:32,flex:1,minHeight:0,overflowY:"auto"}}>
+      {hasMultiple && (
+        <div style={{display:"flex",gap:8,marginBottom:16}}>
+          {receipts.map((rec,i)=>(
+            <button key={i} onClick={()=>setRcptIdx(i)} style={{padding:"8px 20px",borderRadius:8,border:"none",cursor:"pointer",fontFamily:"inherit",fontSize:13,fontWeight:700,background:rcptIdx===i?"#dc2626":"#334155",color:"#fff"}}>
+              {rec.centro}
+            </button>
+          ))}
+        </div>
+      )}
+      <div id="receipt-print" style={{background:"#fff",color:"#000",width:280,padding:20,borderRadius:4,boxShadow:"0 8px 40px rgba(0,0,0,0.5)",fontFamily:"'JetBrains Mono','Courier New',monospace",fontSize:rcptCfg.fontBase,fontWeight:700}}>
+        <ReceiptBody r={r} cfg={rcptCfg} />
+      </div>
+      <div style={{display:"flex",gap:12,marginTop:24,flexWrap:"wrap",justifyContent:"center"}}>
+        <button onClick={()=>printCurrent(r)} style={{background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"10px 24px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:14}}>🖨 Stampa</button>
+        {!isLast
+          ? <button onClick={()=>{setRcptIdx(rcptIdx+1);setAutoPrint(true);}} style={{background:"#dc2626",border:"none",color:"#fff",padding:"10px 24px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>Prossimo → {receipts[rcptIdx+1].centro}</button>
+          : <button onClick={()=>setView("cassa")} style={{background:"#15803d",border:"none",color:"#fff",padding:"10px 24px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>➕ Nuovo Ordine</button>
+        }
+      </div>
+    </div>
+  );
+}
+
+/* ── CALCOLI DEL REPORT ── */
+function useReport(dati, filtri) {
+  const { orders, setOrders, centri, modoSemplice } = dati;
+  const { reportDay, reportCentri, setReportCentri } = filtri;
+  const deleteAllOrders = () => {
+    if (!window.confirm("Eliminare tutti i dati? Non si può annullare.")) return;
+    if (db) { db.ref(DB_ROOT+"/orders").remove(); }
+    setOrders([]);
+    localStorage.removeItem(EVENT_PREFIX+"orders");
+  };
+
+  const deleteOrder = (order) => {
+    if (!window.confirm("Annullare lo scontrino N." + String(order.id).padStart(4,"0") + "?")) return;
+    if (db && order._key) {
+      db.ref(DB_ROOT+"/orders/" + order._key).remove();
+    } else {
+      const no = orders.filter(o => o.id !== order.id);
+      setOrders(no);
+      localStorage.setItem(EVENT_PREFIX+"orders", JSON.stringify(no));
+    }
+  };
+
   const today = giornoDi(new Date().toLocaleDateString("it-IT"));
-  const [reportDay, setReportDay] = useState(today); // giornata selezionata nel report ("all" = tutte)
 
   /* ── FILTRO REPORT PER CENTRO DI COSTO ──
      Vuoto = tutti i centri. Si possono selezionare piu' centri insieme
      (es. CALCIO + VARCO). Il filtro lavora sui singoli ARTICOLI, non sullo
      scontrino intero: uno scontrino con bere e cibo conta solo per la parte
      del centro scelto. Lo sconto dello scontrino e' ripartito in proporzione. */
-  const [reportCentri, setReportCentri] = useState([]);
   const centriSel = React.useMemo(
     () => reportCentri.filter(id => centri.some(c => c.id === id)), [reportCentri, centri]);
   const toggleReportCentro = id =>
@@ -1362,7 +1709,6 @@ function POS({ theme, toggleTheme }) {
     doc.save("report_festival_" + dateStr + suffissoFile() + ".pdf");
   };
 
-  // Modale per inserire una nota libera sulla pizza (condivisa mobile + desktop)
   const pillFiltro = on => ({ background:on?"#dc2626":"#1e293b", border:`1px solid ${on?"#dc2626":"#334155"}`,
     color:on?"#fff":"#94a3b8", padding:"7px 13px", borderRadius:20, cursor:"pointer", fontSize:12,
     fontWeight:700, fontFamily:"inherit", whiteSpace:"nowrap" });
@@ -1387,25 +1733,347 @@ function POS({ theme, toggleTheme }) {
     </div>
   );
 
-  const noteModalJSX = noteItem && (
-    <div onClick={()=>{setNoteItem(null);setNoteText("");}} style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.75)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
-      <div onClick={e=>e.stopPropagation()} style={{background:"#1e293b",border:"1px solid #334155",borderRadius:16,padding:20,maxWidth:380,width:"100%",maxHeight:"calc(var(--app-h, 100dvh) - 28px)",overflowY:"auto",boxShadow:"0 20px 60px rgba(0,0,0,0.5)"}}>
-        <div style={{fontSize:18,fontWeight:800,color:"#f8fafc",marginBottom:6,letterSpacing:"-0.3px"}}>🍕 {noteItem.name}</div>
-        <div style={{fontSize:13,color:"#94a3b8",marginBottom:14}}>Aggiungi una nota per la cucina (es. senza cipolla, base bianca…). Lascia vuoto se non serve.</div>
-        {noteItem.variants && noteItem.variants.length > 0 && (
-          <div style={{display:"flex",flexWrap:"wrap",gap:6,marginBottom:12}}>
-            {noteItem.variants.map(v => (
-              <button key={v} onClick={()=>setNoteText(t => t ? t+", "+v : v)} style={{background:"#0f172a",border:"1px solid #334155",color:"#e2e8f0",padding:"6px 10px",borderRadius:16,cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>+ {v}</button>
-            ))}
-          </div>
-        )}
-        <textarea value={noteText} onChange={e=>setNoteText(e.target.value)} autoFocus rows={3} placeholder="Es. senza cipolla" style={{width:"100%",background:"#0f172a",border:"1px solid #334155",color:"#e2e8f0",padding:"12px",borderRadius:10,fontSize:15,fontFamily:"inherit",outline:"none",resize:"vertical",boxSizing:"border-box"}} />
-        <div style={{display:"flex",gap:10,marginTop:16}}>
-          <button onClick={()=>{setNoteItem(null);setNoteText("");}} style={{flex:1,background:"transparent",border:"1px solid #334155",color:"#94a3b8",padding:"12px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:14}}>Annulla</button>
-          <button onClick={confirmNote} style={{flex:2,background:"#dc2626",border:"none",color:"#fff",padding:"12px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:15,fontWeight:700}}>✓ Aggiungi</button>
+  return { deleteAllOrders, deleteOrder, reportDays, ordersF, scopeO, scopeRev, totalRev,
+           payBreak, topItems, omaggi, omaggiVal, centriBreak, exportExcel, exportPDF,
+           filtroCentriJSX };
+}
+
+/* ── PAGINA REPORT ── */
+function PaginaReport({ dati, cassa, filtriReport, isMobile }) {
+  const { editOrder } = cassa;
+  const { reportDay, setReportDay } = filtriReport;
+  const { deleteAllOrders, deleteOrder, reportDays, ordersF, scopeO, scopeRev, totalRev,
+          payBreak, topItems, omaggi, omaggiVal, centriBreak, exportExcel, exportPDF,
+          filtroCentriJSX } = useReport(dati, filtriReport);
+
+  if (isMobile) return (
+    <div style={{flex:1,overflowY:"auto",padding:"12px 10px"}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+        <div style={{fontSize:18,fontWeight:900,color:"#f8fafc"}}>📊 Report</div>
+        <div style={{display:"flex",gap:6}}>
+          <button onClick={exportExcel} style={{background:"#15803d",border:"none",color:"#fff",padding:"8px 14px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:13,fontWeight:700}}>📥 Excel</button>
+          <button onClick={exportPDF} style={{background:"#b91c1c",border:"none",color:"#fff",padding:"8px 14px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:13,fontWeight:700}}>📄 PDF</button>
         </div>
       </div>
+      {/* Selettore giornata */}
+      <div style={{marginBottom:14}}>
+        <select value={reportDay} onChange={e=>setReportDay(e.target.value)} style={{width:"100%",background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"10px 12px",borderRadius:10,fontSize:14,fontFamily:"inherit",outline:"none"}}>
+          <option value="all">📅 Tutte le giornate</option>
+          {reportDays.map(d=><option key={d} value={d}>{d}</option>)}
+        </select>
+      </div>
+      {filtroCentriJSX}
+      {/* Stat cards */}
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+        {[[reportDay==="all"?"Incasso":"Giornata",fmt(scopeRev),scopeO.filter(o=>!isOmaggio(o)).length+" scontrini"],["Omaggi",fmt(omaggiVal),omaggi.length+" scontrini"],["Media",scopeO.filter(o=>!isOmaggio(o)).length?fmt(scopeRev/scopeO.filter(o=>!isOmaggio(o)).length):"€0.00","per scontrino"],[EVT.totaleLabel,fmt(totalRev),ordersF.length+" scontrini"]].map(([l,v,s])=>(
+          <div key={l} style={{background:"#1e293b",borderRadius:10,padding:"12px 14px",border:"1px solid #334155",gridColumn:l===EVT.totaleLabel?"span 2":"auto"}}>
+            <div style={{fontSize:11,color:"#64748b",textTransform:"uppercase",letterSpacing:1,marginBottom:4}}>{l}</div>
+            <div style={{fontSize:22,fontWeight:900,color:"#4ade80"}}>{v}</div>
+            <div style={{fontSize:11,color:"#64748b",marginTop:2}}>{s}</div>
+          </div>
+        ))}
+      </div>
+      {/* Incasso per centro di costo */}
+      <div style={{background:"#1e293b",borderRadius:10,padding:"14px",border:"1px solid #334155",marginBottom:10}}>
+        <div style={{fontSize:14,fontWeight:700,color:"#f8fafc",marginBottom:10}}>🏭 Incasso per centro di costo</div>
+        {!centriBreak.length&&<div style={{color:"#64748b",fontSize:13}}>Nessun dato</div>}
+        {centriBreak.map(([nome,d])=>(
+          <div key={nome} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",borderBottom:"1px solid #334155"}}>
+            <span style={{flex:1,fontSize:13,fontWeight:600}}>{nome}</span>
+            <span style={{color:"#64748b",fontSize:12}}>{d.qty} pz</span>
+            <span style={{fontWeight:700,color:"#4ade80",fontSize:13,minWidth:70,textAlign:"right"}}>{fmt(d.tot)}</span>
+          </div>
+        ))}
+      </div>
+      {/* Top prodotti */}
+      <div style={{background:"#1e293b",borderRadius:10,padding:"14px",border:"1px solid #334155",marginBottom:10}}>
+        <div style={{fontSize:14,fontWeight:700,color:"#f8fafc",marginBottom:10}}>🏆 Top Prodotti</div>
+        {!topItems.length&&<div style={{color:"#64748b",fontSize:13}}>Nessun dato</div>}
+        {topItems.map(([name,qty],i)=>(
+          <div key={name} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",borderBottom:"1px solid #334155"}}>
+            <span style={{color:"#64748b",fontSize:12,width:20}}>#{i+1}</span>
+            <span style={{flex:1,fontSize:13}}>{name}</span>
+            <span style={{fontWeight:700,color:"#fbbf24",fontSize:13}}>{qty} pz</span>
+          </div>
+        ))}
+      </div>
+      {/* Ultimi scontrini */}
+      <div style={{background:"#1e293b",borderRadius:10,padding:"14px",border:"1px solid #334155",marginBottom:10}}>
+        <div style={{fontSize:14,fontWeight:700,color:"#f8fafc",marginBottom:10}}>🧾 Scontrini {reportDay==="all"?"(ultimi 50)":"· "+reportDay}</div>
+        {!scopeO.length&&<div style={{color:"#64748b",fontSize:13}}>Nessun ordine</div>}
+        {[...scopeO].reverse().slice(0,reportDay==="all"?50:99999).map(o=>(
+          <div key={o.id} style={{padding:"8px 0",borderBottom:"1px solid #334155"}}>
+            <div style={{display:"flex",alignItems:"center",gap:8}}>
+              <span style={{color:"#64748b",fontSize:11}}>{String(o.id).padStart(4,"0")}</span>
+              <div style={{flex:1}}>
+                <div style={{fontSize:12,color:"#e2e8f0"}}>{o.date}</div>
+                <div style={{fontSize:11,color:"#64748b",textTransform:"capitalize"}}>{o.pay} {o.table?"· "+o.table:""}</div>
+              </div>
+              <span style={{fontWeight:900,color:"#4ade80",fontSize:14}}>{fmt(o.total)}</span>
+            </div>
+            <div style={{display:"flex",gap:6,marginTop:6}}>
+              <button onClick={()=>editOrder(o._orig||o)} style={{flex:1,background:"#1d4ed8",border:"none",color:"#fff",padding:"6px",borderRadius:6,cursor:"pointer",fontFamily:"inherit",fontSize:11,fontWeight:700}}>✏️ Modifica</button>
+              <button onClick={()=>deleteOrder(o._orig||o)} style={{flex:1,background:"#7f1d1d",border:"none",color:"#fca5a5",padding:"6px",borderRadius:6,cursor:"pointer",fontFamily:"inherit",fontSize:11,fontWeight:700}}>🗑 Annulla</button>
+            </div>
+          </div>
+        ))}
+      </div>
+      <div style={{textAlign:"center",paddingBottom:20}}>
+        <button onClick={deleteAllOrders} style={{background:"#7f1d1d",border:"1px solid #991b1b",color:"#fca5a5",padding:"10px 20px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:13}}>
+          🗑 Azzera Dati
+        </button>
+      </div>
     </div>
+  );
+
+  return (
+    <div style={{padding:24,maxWidth:1000,margin:"0 auto",width:"100%",overflowY:"auto",flex:1,minHeight:0}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:24,flexWrap:"wrap",gap:12}}>
+        <h2 style={{fontSize:24,fontWeight:900,color:"#f8fafc"}}>📊 Report & Statistiche</h2>
+        <div style={{display:"flex",alignItems:"center",gap:12}}>
+          <select value={reportDay} onChange={e=>setReportDay(e.target.value)} style={{background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"10px 14px",borderRadius:8,fontSize:14,fontFamily:"inherit",outline:"none",cursor:"pointer"}}>
+            <option value="all">📅 Tutte le giornate</option>
+            {reportDays.map(d=><option key={d} value={d}>{d}</option>)}
+          </select>
+          <button onClick={exportExcel} style={{background:"#15803d",border:"1px solid #16a34a",color:"#fff",padding:"10px 20px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>📥 Scarica Excel</button>
+          <button onClick={exportPDF} style={{background:"#b91c1c",border:"1px solid #dc2626",color:"#fff",padding:"10px 20px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>📄 Scarica PDF</button>
+        </div>
+      </div>
+      {filtroCentriJSX}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:16,marginBottom:24}}>
+        {[[reportDay==="all"?"Incasso totale":"Incasso giornata",fmt(scopeRev),scopeO.filter(o=>!isOmaggio(o)).length+" scontrini"],["Omaggi",fmt(omaggiVal),omaggi.length+" scontrini"],["Scontrino medio",scopeO.filter(o=>!isOmaggio(o)).length?fmt(scopeRev/scopeO.filter(o=>!isOmaggio(o)).length):"€0.00","media"],[EVT.totaleLabel,fmt(totalRev),ordersF.length+" scontrini totali"]].map(([l,v,s])=>(
+          <div key={l} style={{background:"#1e293b",borderRadius:12,padding:20,border:"1px solid #334155"}}>
+            <div style={{fontSize:12,color:"#64748b",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>{l}</div>
+            <div style={{fontSize:28,fontWeight:900,color:"#4ade80"}}>{v}</div>
+            <div style={{fontSize:12,color:"#64748b",marginTop:4}}>{s}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:16}}>
+        <div style={{background:"#1e293b",borderRadius:12,padding:20,border:"1px solid #334155"}}>
+          <h3 style={{fontSize:15,fontWeight:700,marginBottom:14,color:"#f8fafc"}}>💳 Metodi di Pagamento</h3>
+          {!Object.keys(payBreak).length&&<p style={{color:"#64748b"}}>Nessun dato</p>}
+          {Object.entries(payBreak).map(([m,v])=>(
+            <div key={m} style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+              <span style={{textTransform:"capitalize",minWidth:70}}>{m}</span>
+              <div style={{flex:1,height:8,background:"#334155",borderRadius:4,overflow:"hidden"}}><div style={{height:"100%",background:"#dc2626",borderRadius:4,width:`${(v/(scopeRev||1)*100).toFixed(0)}%`,minWidth:4}}/></div>
+              <span style={{fontWeight:700,color:"#f87171",minWidth:70,textAlign:"right"}}>{fmt(v)}</span>
+            </div>
+          ))}
+        </div>
+        <div style={{background:"#1e293b",borderRadius:12,padding:20,border:"1px solid #334155"}}>
+          <h3 style={{fontSize:15,fontWeight:700,marginBottom:14,color:"#f8fafc"}}>🏆 Top 5 Prodotti</h3>
+          {!topItems.length&&<p style={{color:"#64748b"}}>Nessun dato</p>}
+          {topItems.map(([name,qty],i)=>(
+            <div key={name} style={{display:"flex",gap:10,padding:"6px 0",borderBottom:"1px solid #334155",alignItems:"center"}}>
+              <span style={{color:"#64748b",width:24}}>#{i+1}</span>
+              <span style={{flex:1}}>{name}</span>
+              <span style={{fontWeight:700,color:"#fbbf24"}}>{qty} pz</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div style={{background:"#1e293b",borderRadius:12,padding:20,border:"1px solid #334155",marginBottom:16}}>
+        <h3 style={{fontSize:15,fontWeight:700,marginBottom:14,color:"#f8fafc"}}>🏭 Incasso per centro di costo</h3>
+        {!centriBreak.length&&<p style={{color:"#64748b"}}>Nessun dato</p>}
+        {centriBreak.map(([nome,d])=>(
+          <div key={nome} style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
+            <span style={{minWidth:160,fontWeight:600}}>{nome}</span>
+            <span style={{color:"#64748b",fontSize:12,minWidth:70}}>{d.qty} pz</span>
+            <div style={{flex:1,height:8,background:"#334155",borderRadius:4,overflow:"hidden"}}><div style={{height:"100%",background:"#0ea5e9",borderRadius:4,width:`${(d.tot/(scopeRev||1)*100).toFixed(0)}%`,minWidth:4}}/></div>
+            <span style={{color:"#64748b",fontSize:12,minWidth:50,textAlign:"right"}}>{(d.tot/(scopeRev||1)*100).toFixed(1)}%</span>
+            <span style={{fontWeight:700,color:"#4ade80",minWidth:80,textAlign:"right"}}>{fmt(d.tot)}</span>
+          </div>
+        ))}
+      </div>
+      <div style={{background:"#1e293b",borderRadius:12,padding:20,border:"1px solid #334155",marginBottom:16}}>
+        <h3 style={{fontSize:15,fontWeight:700,marginBottom:14,color:"#f8fafc"}}>🧾 Scontrini {reportDay==="all"?"(ultimi 50)":"· "+reportDay}</h3>
+        {!scopeO.length&&<p style={{color:"#64748b"}}>Nessun ordine</p>}
+        <div style={{overflowX:"auto"}}>
+          <div style={{display:"grid",gridTemplateColumns:"50px 1fr 80px 40px 90px 80px 80px",gap:8,padding:"8px 0",color:"#64748b",borderBottom:"1px solid #334155",fontSize:11,textTransform:"uppercase"}}>
+            <span>#</span><span>Data</span><span>Tavolo</span><span>Art.</span><span>Pagamento</span><span>Totale</span><span>Azioni</span>
+          </div>
+          {[...scopeO].reverse().slice(0,reportDay==="all"?50:99999).map(o=>(
+            <div key={o.id} style={{display:"grid",gridTemplateColumns:"50px 1fr 80px 40px 90px 80px 80px",gap:8,padding:"8px 0",borderBottom:"1px solid #1e293b",alignItems:"center",fontSize:13}}>
+              <span style={{color:"#64748b"}}>{String(o.id).padStart(4,"0")}</span>
+              <span style={{fontSize:12,color:"#94a3b8"}}>{o.date}</span>
+              <span>{o.table||"—"}</span>
+              <span>{o.items.reduce((s,i)=>s+i.qty,0)}</span>
+              <span style={{textTransform:"capitalize",color:"#38bdf8"}}>{o.pay}</span>
+              <span style={{fontWeight:700,color:"#4ade80"}}>{fmt(o.total)}</span>
+              <div style={{display:"flex",gap:4}}>
+                <button onClick={()=>editOrder(o._orig||o)} title="Modifica" style={{background:"#1d4ed8",border:"none",color:"#fff",padding:"4px 8px",borderRadius:6,cursor:"pointer",fontSize:12}}>✏️</button>
+                <button onClick={()=>deleteOrder(o._orig||o)} title="Annulla" style={{background:"#7f1d1d",border:"none",color:"#fca5a5",padding:"4px 8px",borderRadius:6,cursor:"pointer",fontSize:12}}>🗑</button>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div style={{textAlign:"center",marginTop:16}}>
+        <button onClick={deleteAllOrders} style={{background:"#7f1d1d",border:"1px solid #991b1b",color:"#fca5a5",padding:"8px 20px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:13}}>🗑 Azzera Tutti i Dati</button>
+      </div>
+    </div>
+  );
+}
+
+/* Contenitore comune alle pagine a scorrimento */
+function ContenitorePagina({ isMobile, children }) {
+  return isMobile
+    ? <div style={{flex:1,overflowY:"auto",padding:"12px 10px"}}>{children}</div>
+    : <div style={{padding:24,maxWidth:1000,margin:"0 auto",width:"100%",overflowY:"auto",flex:1,minHeight:0}}>{children}</div>;
+}
+
+/* ── PAGINA CUCINA ── */
+function PaginaCucina({ dati, isMobile }) {
+  const { comande } = dati;
+  // === FUNZIONI COMANDE (Cucina) ===
+  const toggleComandaItem = (comanda, itemUid) => {
+    const newItems = comanda.items.map(it =>
+      it.uid === itemUid ? {...it, done: !it.done} : it
+    );
+    // NB: spuntare tutte le voci NON archivia più la comanda in automatico.
+    // La comanda resta in lavorazione finché non viene eliminata/archiviata a mano.
+    if (db && comanda._key) db.ref(DB_ROOT+"/comande/" + comanda._key).update({ items: newItems });
+  };
+
+  const consegnaScontrino = (comanda) => {
+    if (db && comanda._key) db.ref(DB_ROOT+"/comande/" + comanda._key).update({ stato: "lavorazione" });
+  };
+
+  const evadiComanda = (comanda) => {
+    const newItems = comanda.items.map(it => ({...it, done: true}));
+    if (db && comanda._key) db.ref(DB_ROOT+"/comande/" + comanda._key).update({ items: newItems, evasa: true, stato: "evasa" });
+  };
+
+  const svuotaStorico = () => {
+    const evase = comande.filter(c => c.evasa || c.stato === "evasa");
+    if (!evase.length) { alert("Lo storico è già vuoto."); return; }
+    if (!window.confirm("Eliminare tutte le " + evase.length + " comande evase dallo storico? Non si può annullare.")) return;
+    if (db) evase.forEach(c => { if (c._key) db.ref(DB_ROOT+"/comande/" + c._key).remove(); });
+  };
+
+  const deleteComanda = (comanda) => {
+    if (!window.confirm("Eliminare definitivamente la comanda di " + comanda.cliente + "?")) return;
+    if (db && comanda._key) db.ref(DB_ROOT+"/comande/" + comanda._key).remove();
+  };
+
+  // Sposta una comanda (da attesa o lavorazione) direttamente nello storico
+  const archiviaComanda = (comanda) => {
+    if (!window.confirm("Spostare la comanda di " + comanda.cliente + " nello storico?")) return;
+    if (db && comanda._key) db.ref(DB_ROOT+"/comande/" + comanda._key).update({ stato: "evasa", evasa: true });
+  };
+
+  // Riporta una comanda dallo storico allo stato "in attesa" (azzera le spunte)
+  const riportaInAttesa = (comanda) => {
+    if (db && comanda._key) {
+      const resetItems = (comanda.items || []).map(it => ({ ...it, done: false }));
+      db.ref(DB_ROOT+"/comande/" + comanda._key).update({ stato: "attesa", evasa: false, items: resetItems });
+    }
+  };
+
+  return (
+    <ContenitorePagina isMobile={isMobile}>
+      <CucinaView comande={comande} toggleComandaItem={toggleComandaItem} evadiComanda={evadiComanda} consegnaScontrino={consegnaScontrino} deleteComanda={deleteComanda} archiviaComanda={archiviaComanda} riportaInAttesa={riportaInAttesa} svuotaStorico={svuotaStorico} isMobile={isMobile} />
+    </ContenitorePagina>
+  );
+}
+
+/* ── PAGINA ARTICOLI ── */
+function PaginaArticoli({ dati, isMobile }) {
+  const { menu, saveMenu, centri, saveCentri } = dati;
+  return (
+    <ContenitorePagina isMobile={isMobile}>
+      <ArticoliManager menu={menu} saveMenu={saveMenu} centri={centri} saveCentri={saveCentri} isMobile={isMobile} />
+    </ContenitorePagina>
+  );
+}
+
+/* ── PAGINA IMPOSTAZIONI ── */
+function PaginaImpostazioni({ dati, stampa, isMobile }) {
+  const { rcptCfg, saveRcptCfg, resetRcptCfg, centri, saveCentri, syncStatus } = dati;
+  const { anteprimaScontrino } = stampa;
+
+  if (isMobile) return (
+    <div style={{flex:1,overflowY:"auto",padding:"12px 10px"}}>
+      <div style={{fontSize:18,fontWeight:900,color:"#f8fafc",marginBottom:14}}>⚙️ Impostazioni</div>
+      <AdattaSchermo />
+      <SceltaStampante />
+      <div style={{background:"#1e293b",borderRadius:10,padding:14,border:"1px solid #334155",marginBottom:10}}>
+        <div style={{fontSize:14,fontWeight:700,color:"#f8fafc",marginBottom:10}}>🖨️ Rotolo Termico 80mm</div>
+        {[["1️⃣","Collega la stampante termica via USB"],["2️⃣","Installa i driver dal sito del produttore"],["3️⃣","Impostala come stampante predefinita in Windows"],["4️⃣","Clicca Stampa → seleziona la termica"],["5️⃣","Imposta margini = Nessuno, scala = 100%"],["6️⃣","Salva come impostazioni predefinite"]].map(([n,t])=>(
+          <div key={n} style={{display:"flex",gap:10,padding:"8px 0",borderBottom:"1px solid #334155"}}>
+            <span style={{fontSize:16,flexShrink:0}}>{n}</span>
+            <span style={{fontSize:12,color:"#cbd5e1",lineHeight:1.5}}>{t}</span>
+          </div>
+        ))}
+      </div>
+      <button onClick={anteprimaScontrino} style={{width:"100%",background:"#1d4ed8",border:"1px solid #3b82f6",color:"#fff",padding:14,borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>
+        🖨️ Scontrino di Prova
+      </button>
+      <ScontrinoConfig cfg={rcptCfg} save={saveRcptCfg} reset={resetRcptCfg} anteprima={anteprimaScontrino} centri={centri} saveCentri={saveCentri} isMobile={true} />
+      <FirebaseConfig syncStatus={syncStatus} />
+    </div>
+  );
+
+  return (
+    <div style={{padding:24,maxWidth:1000,margin:"0 auto",width:"100%",overflowY:"auto",flex:1,minHeight:0}}>
+      <h2 style={{fontSize:24,fontWeight:900,marginBottom:24,color:"#f8fafc"}}>⚙️ Impostazioni</h2>
+      <AdattaSchermo />
+      <SceltaStampante />
+      <div style={{background:"#1e293b",borderRadius:12,padding:20,border:"1px solid #334155",marginBottom:16}}>
+        <h3 style={{fontSize:15,fontWeight:700,marginBottom:14,color:"#f8fafc"}}>🖨️ Rotolo Termico 80mm</h3>
+        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+          {[["1️⃣","Collega la stampante termica al PC via USB"],["2️⃣","Installa i driver dal sito del produttore"],["3️⃣","Impostala come stampante predefinita in Windows"],["4️⃣","Clicca Stampa → seleziona la stampante termica"],["5️⃣","Imposta: Margini = Nessuno · Scala = 100%"],["6️⃣","Salva queste impostazioni come predefinite"]].map(([n,t])=>(
+            <div key={n} style={{display:"flex",gap:14,background:"#0f172a",borderRadius:8,padding:"12px 16px",alignItems:"flex-start"}}>
+              <span style={{fontSize:18,flexShrink:0}}>{n}</span>
+              <span style={{fontSize:13,color:"#cbd5e1",lineHeight:1.6}}>{t}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+      <button onClick={anteprimaScontrino} style={{background:"#1d4ed8",border:"1px solid #3b82f6",color:"#fff",padding:"10px 24px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>🖨️ Scontrino di Prova</button>
+      <ScontrinoConfig cfg={rcptCfg} save={saveRcptCfg} reset={resetRcptCfg} anteprima={anteprimaScontrino} centri={centri} saveCentri={saveCentri} isMobile={false} />
+      <FirebaseConfig syncStatus={syncStatus} />
+    </div>
+  );
+}
+
+/* ── GUSCIO DEL PROGRAMMA ── */
+function POS({ theme, toggleTheme }) {
+  const [view, setView]     = useState("cassa"); // cassa | carrello | scontrino | report | impostazioni
+  const dati   = useDatiEvento();
+  const stampa = useStampa(dati, view, setView);
+
+  /* Layout a schede (Menu / Carrello) solo quando la finestra e' STRETTA:
+     telefoni, tablet in verticale, finestre a mezzo schermo. Sui PC, anche
+     con schermo basso, resta il layout a due colonne: e' la CSS "compatta"
+     (vedi <style>) a rimpicciolire tutto, cosi' TOTALE e Incassa restano
+     sempre visibili qualunque sia lo zoom o la scalatura di Windows. */
+  const schermoStretto = () => window.innerWidth < 900;
+  const [isMobile, setIsMobile] = useState(schermoStretto());
+
+  useEffect(() => {
+    const h = () => setIsMobile(schermoStretto());
+    window.addEventListener("resize", h);
+    return () => window.removeEventListener("resize", h);
+  }, []);
+
+  const cassa = useCassa(dati, stampa, setView, isMobile);
+
+  // I filtri del report restano impostati quando si cambia pagina
+  const today = giornoDi(new Date().toLocaleDateString("it-IT"));
+  const [reportDay, setReportDay] = useState(today); // giornata selezionata nel report ("all" = tutte)
+  const [reportCentri, setReportCentri] = useState([]);
+  const filtriReport = { reportDay, setReportDay, reportCentri, setReportCentri };
+
+  const { syncStatus } = dati;
+  const { openDrawer } = stampa;
+  const { flash } = cassa;
+
+  const pagina = PAGINE.find(p => p.viste.includes(view));
+  const contenutoPagina = pagina && (
+    <pagina.Componente dati={dati} cassa={cassa} stampa={stampa} filtriReport={filtriReport}
+                       view={view} setView={setView} isMobile={isMobile} />
   );
 
   /* ── MOBILE LAYOUT ── */
@@ -1415,37 +2083,7 @@ function POS({ theme, toggleTheme }) {
       {/* Microstampa nascosta per apertura cassetto */}
       <div id="drawer-print" style={{position:"fixed",left:"-9999px",top:0,visibility:"hidden",textAlign:"center",fontFamily:"'JetBrains Mono','Courier New',monospace",fontSize:12,fontWeight:700}}>APERTURA CASSETTO</div>
 
-      {/* MODAL SELETTORE VARIANTI */}
-      {variantPick && (
-        <div onClick={()=>setVariantPick(null)} style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.75)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
-          <div onClick={e=>e.stopPropagation()} style={{background:"#1e293b",border:"1px solid #334155",borderRadius:16,padding:20,maxWidth:380,width:"100%",maxHeight:"calc(var(--app-h, 100dvh) - 28px)",display:"flex",flexDirection:"column",boxShadow:"0 20px 60px rgba(0,0,0,0.5)"}}>
-            <div style={{fontSize:18,fontWeight:800,color:"#f8fafc",marginBottom:6,letterSpacing:"-0.3px",flexShrink:0}}>{variantPick.name}</div>
-            <div style={{fontSize:13,color:"#94a3b8",marginBottom:16,flexShrink:0}}>Scegli le opzioni — puoi selezionarne più di una, poi premi Fatto</div>
-            <div style={{display:"flex",flexDirection:"column",gap:10,overflowY:"auto",minHeight:0,flex:"1 1 auto",margin:"0 -4px",padding:"4px"}}>
-              {variantPick.variants.map(v => {
-                const on = variantSel.includes(v);
-                return (
-                  <button key={v} onClick={()=>toggleVariant(v)} style={{background:on?"#7f1d1d":"#0f172a",border:"1px solid "+(on?"#dc2626":"#334155"),color:on?"#fff":"#e2e8f0",padding:"14px 16px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:15,fontWeight:600,textAlign:"left",display:"flex",alignItems:"center",justifyContent:"space-between",gap:10}}>
-                    <span>{v}</span>
-                    <span style={{fontSize:16,opacity:on?1:0.3}}>{on?"\u2713":"\u25cb"}</span>
-                  </button>
-                );
-              })}
-            </div>
-            <div style={{display:"flex",gap:10,marginTop:16,flexShrink:0}}>
-              <button onClick={()=>{setVariantPick(null);setVariantSel([]);}} style={{flex:1,background:"transparent",border:"1px solid #334155",color:"#94a3b8",padding:"12px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:14}}>
-                Annulla
-              </button>
-              <button onClick={confirmVariants} style={{flex:2,background:"#dc2626",border:"none",color:"#fff",padding:"12px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:15,fontWeight:700}}>
-                {"\u2713 Fatto"}{variantSel.length>0?" ("+variantSel.length+")":""}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* MODALE NOTA PIZZA */}
-      {noteModalJSX}
+      <ModaliCassa cassa={cassa} />
 
       {/* TOP BAR */}
       <div className="topnav" style={{background:"#1e293b",padding:"8px 12px",display:"flex",alignItems:"center",justifyContent:"space-between",gap:8,borderBottom:"1px solid #334155",flexShrink:0}}>
@@ -1456,7 +2094,7 @@ function POS({ theme, toggleTheme }) {
           </div>
         </div>
         <div style={{display:"flex",gap:6}}>
-          {[["cassa","🧾"],["cucina","🧑‍🍳"],["report","📊"],["articoli","🍔"],["impostazioni","⚙️"]].map(([v,ic])=>(
+          {PAGINE.filter(p=>!p.nascosta).map(({id:v,icona:ic})=>(
             <button key={v} onClick={()=>setView(v)} style={{background:view===v?"#dc2626":"#334155",border:"none",color:"#fff",width:38,height:38,borderRadius:10,fontSize:18,cursor:"pointer"}}>
               {ic}
             </button>
@@ -1472,344 +2110,24 @@ function POS({ theme, toggleTheme }) {
         {flash}
       </div>}
 
-      {/* ── CASSA VIEW MOBILE ── */}
-      {(view==="cassa"||view==="carrello") && (
-        <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minHeight:0}}>
-
-          {/* Tab switcher: Menù / Carrello */}
-          <div style={{display:"flex",background:"#0f172a",borderBottom:"1px solid #334155",flexShrink:0}}>
-            <button onClick={()=>setView("cassa")} style={{flex:1,padding:"10px",background:view==="cassa"?"#1e293b":"transparent",border:"none",color:view==="cassa"?"#f8fafc":"#64748b",fontFamily:"inherit",fontSize:13,fontWeight:700,borderBottom:view==="cassa"?"2px solid #dc2626":"2px solid transparent",cursor:"pointer"}}>
-              🍽 Menù
-            </button>
-            <button onClick={()=>setView("carrello")} style={{flex:1,padding:"10px",background:view==="carrello"?"#1e293b":"transparent",border:"none",color:view==="carrello"?"#f8fafc":"#64748b",fontFamily:"inherit",fontSize:13,fontWeight:700,borderBottom:view==="carrello"?"2px solid #dc2626":"2px solid transparent",cursor:"pointer",position:"relative"}}>
-              🛒 Carrello {cartCount>0&&<span style={{background:"#dc2626",color:"#fff",borderRadius:10,padding:"1px 7px",fontSize:11,marginLeft:4}}>{cartCount}</span>}
-            </button>
-          </div>
-
-          {/* MENÙ TAB */}
-          {view==="cassa" && (
-            <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minHeight:0}}>
-              {/* Search */}
-              <div style={{padding:"8px 10px",flexShrink:0,display:"flex",gap:8}}>
-                <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="🔍 Cerca..." style={{flex:1,minWidth:0,background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"10px 14px",borderRadius:10,fontSize:14,fontFamily:"inherit",outline:"none"}} />
-                <button onClick={openDrawer} title="Apri cassetto" style={{flexShrink:0,width:48,background:"#334155",border:"1px solid #475569",color:"#fff",borderRadius:10,cursor:"pointer",fontSize:20}}>💶</button>
-              </div>
-              {/* Category pills */}
-              <div style={{display:"flex",gap:6,padding:"0 10px 8px",overflowX:"auto",flexShrink:0,scrollbarWidth:"none"}}>
-                <button onClick={()=>setCat("Tutti")} style={{background:cat==="Tutti"?"#dc2626":"#1e293b",border:`1px solid ${cat==="Tutti"?"#dc2626":"#334155"}`,color:cat==="Tutti"?"#fff":"#94a3b8",padding:"8px 14px",borderRadius:20,cursor:"pointer",fontSize:12,fontWeight:700,fontFamily:"inherit",whiteSpace:"nowrap",flexShrink:0}}>
-                  🔍 Tutti
-                </button>
-                {modoSemplice && catsConArticoli.map(c=>(
-                  <button key={c} onClick={()=>setCat(c)} style={{background:cat===c?"#dc2626":"#1e293b",border:`1px solid ${cat===c?"#dc2626":"#334155"}`,color:cat===c?"#fff":"#94a3b8",padding:"8px 14px",borderRadius:20,cursor:"pointer",fontSize:12,fontWeight:700,fontFamily:"inherit",whiteSpace:"nowrap",flexShrink:0}}>
-                    {c}
-                  </button>
-                ))}
-                {!modoSemplice && centriConArticoli.map(c=>{
-                  const on = centroSelezionato && centroSelezionato.id === c.id;
-                  return (
-                    <button key={c.id} onClick={()=>setCat("c:"+c.id)} style={{background:on?"#dc2626":"#1e293b",border:`1px solid ${on?"#dc2626":"#334155"}`,color:on?"#fff":"#94a3b8",padding:"8px 14px",borderRadius:20,cursor:"pointer",fontSize:12,fontWeight:700,fontFamily:"inherit",whiteSpace:"nowrap",flexShrink:0}}>
-                      <span style={{fontSize:15,marginRight:5}}>{c.emoji}</span>{c.nome}
-                    </button>
-                  );
-                })}
-              </div>
-              {!modoSemplice && sottoCategorie.length > 0 && (
-                <div style={{display:"flex",gap:6,padding:"0 10px 8px",overflowX:"auto",flexShrink:0,scrollbarWidth:"none"}}>
-                  <button onClick={()=>setCat("c:"+centroSelezionato.id)} style={{background:String(cat).startsWith("c:")?"#7f1d1d":"transparent",border:"1px solid #334155",color:String(cat).startsWith("c:")?"#fff":"#64748b",padding:"5px 12px",borderRadius:16,cursor:"pointer",fontSize:11,fontFamily:"inherit",whiteSpace:"nowrap",flexShrink:0}}>
-                    Tutto {centroSelezionato.nome}
-                  </button>
-                  {sottoCategorie.map(sc=>(
-                    <button key={sc} onClick={()=>setCat(sc)} style={{background:cat===sc?"#7f1d1d":"transparent",border:`1px solid ${cat===sc?"#dc2626":"#334155"}`,color:cat===sc?"#fff":"#64748b",padding:"5px 12px",borderRadius:16,cursor:"pointer",fontSize:11,fontFamily:"inherit",whiteSpace:"nowrap",flexShrink:0}}>
-                      {sc}
-                    </button>
-                  ))}
-                </div>
-              )}
-              {/* Product grid */}
-              <div style={{padding:"0 10px 10px",overflowY:"auto",flex:1,minHeight:0}}>
-                {!filtered.length && <div style={{textAlign:"center",color:"#475569",padding:"30px 0",fontSize:14}}>Nessun articolo</div>}
-                {gruppiGriglia.map(g=>(
-                  <div key={g.key} style={{marginBottom:14}}>
-                    {g.titolo && (
-                      <div style={{display:"flex",alignItems:"center",gap:8,margin:"6px 2px 8px"}}>
-                        <div style={{fontSize:12,fontWeight:800,color:"#94a3b8",letterSpacing:0.4,whiteSpace:"nowrap"}}>{g.titolo}</div>
-                        <div style={{flex:1,height:1,background:"#1e293b"}}/>
-                        <div style={{fontSize:11,color:"#475569"}}>{g.items.length}</div>
-                      </div>
-                    )}
-                    <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(104px,1fr))",gap:8}}>
-                      {g.items.map(item=>(
-                        <button key={item.id} onClick={()=>addItem(item)} className="prod-tile" style={{background:"#1e293b",border:"1px solid #334155",borderRadius:12,padding:"14px 8px",cursor:"pointer",textAlign:"center",color:"#e2e8f0",fontFamily:"inherit",display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:4,minHeight:72}}>
-                          <div style={{fontSize:12,fontWeight:700,lineHeight:1.25,color:"#f1f5f9"}}>{item.name}</div>
-                          <div style={{fontSize:16,color:"#f87171",fontWeight:900,marginTop:3}}>{fmt(item.price)}</div>
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          {/* CARRELLO TAB */}
-          {view==="carrello" && (
-            <div style={{flex:1,display:"flex",flexDirection:"column",overflow:"hidden",minHeight:0}}>
-              {/* Table input */}
-              <div className="cart-head" style={{padding:"8px 10px",flexShrink:0}}>
-                <input value={table} onChange={e=>setTable(e.target.value)} placeholder="👤 Nome cliente (solo se c'è cibo)" style={{width:"100%",background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"10px 14px",borderRadius:10,fontSize:14,fontFamily:"inherit",outline:"none"}} />
-              </div>
-              {/* Cart items */}
-              <div className="scroll-y" style={{flex:"1 1 0",minHeight:0,padding:"0 10px"}}>
-                {!cart.length && (
-                  <div style={{textAlign:"center",color:"#475569",padding:"40px 0",fontSize:15}}>
-                    Nessun articolo<br/><span style={{fontSize:36}}>🛒</span>
-                  </div>
-                )}
-                {cart.map(item=>(
-                  <div key={item.id} style={{display:"flex",alignItems:"center",gap:10,padding:"10px 0",borderBottom:"1px solid #1e293b"}}>
-                    <div style={{flex:1}}>
-                      <div style={{fontSize:13,color:"#e2e8f0",fontWeight:600}}>{item.name}</div>
-                      {item.note && <div style={{fontSize:11,color:"#fbbf24",fontStyle:"italic",marginTop:2}}>📝 {item.note}</div>}
-                    </div>
-                    <button onClick={()=>remItem(item.id)} style={{background:"#334155",border:"none",color:"#e2e8f0",width:32,height:32,borderRadius:8,cursor:"pointer",fontSize:18,fontFamily:"inherit"}}>−</button>
-                    <span style={{width:24,textAlign:"center",fontWeight:900,fontSize:16}}>{item.qty}</span>
-                    <button onClick={()=>addItem(item)} style={{background:"#334155",border:"none",color:"#e2e8f0",width:32,height:32,borderRadius:8,cursor:"pointer",fontSize:18,fontFamily:"inherit"}}>+</button>
-                    <div style={{fontSize:14,fontWeight:900,color:"#f87171",minWidth:55,textAlign:"right"}}>{fmt(item.price*item.qty)}</div>
-                  </div>
-                ))}
-              </div>
-
-              {/* Footer con totale e pagamento */}
-              {cart.length>0 && (
-                <div className="cart-footer" style={{background:"#131f30",borderTop:"1px solid #334155",padding:"10px 14px",paddingBottom:"calc(10px + env(safe-area-inset-bottom))",flexShrink:0,maxHeight:"64%",overflowY:"auto",display:"flex",flexDirection:"column"}}>
-                  {/* Sconto */}
-                  <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:8,flexShrink:0}}>
-                    <span style={{color:"#94a3b8",fontSize:13}}>Sconto %</span>
-                    <input type="number" min="0" max="100" value={disc} onChange={e=>setDisc(Math.min(100,Math.max(0,+e.target.value)))} style={{background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"4px 8px",borderRadius:6,width:64,textAlign:"center",fontSize:14,fontFamily:"inherit",outline:"none"}} />
-                  </div>
-                  {disc>0&&<div style={{display:"flex",justifyContent:"space-between",fontSize:13,color:"#94a3b8",marginBottom:4}}><span>Subtotale</span><span>{fmt(subtotal)}</span></div>}
-                  {disc>0&&<div style={{display:"flex",justifyContent:"space-between",fontSize:13,color:"#f87171",marginBottom:4}}><span>Sconto -{disc}%</span><span>−{fmt(discAmt)}</span></div>}
-                  <div className="cart-tot" style={{display:"flex",justifyContent:"space-between",fontSize:22,fontWeight:900,color:"#4ade80",marginBottom:12,flexShrink:0}}>
-                    <span>TOTALE</span><span>{fmt(total)}</span>
-                  </div>
-                  {/* Payment methods */}
-                  <div className="pay-grid" style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:10,flexShrink:0}}>
-                    {PAGAMENTI.map(([m,ic])=>(
-                      <button key={m} onClick={()=>setPay(m)} style={{background:pay===m?"#991b1b":"#1e293b",border:`2px solid ${pay===m?"#dc2626":"#334155"}`,color:pay===m?"#fff":"#94a3b8",padding:"10px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:13,fontWeight:700,textTransform:"capitalize"}}>
-                        {ic} {m}
-                      </button>
-                    ))}
-                  </div>
-                  {/* Actions — sticky in fondo: sempre visibili */}
-                  <div className="act-bar" style={{display:"flex",gap:8,flexShrink:0,background:"#131f30",paddingTop:4}}>
-                    <button onClick={clearCart} style={{flex:1,background:"#7f1d1d",border:"none",color:"#fca5a5",padding:"13px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>
-                      🗑 Cancella
-                    </button>
-                    <button onClick={checkout} disabled={processing} style={{flex:2,background:processing?"#166534":"#15803d",border:"none",color:"#fff",padding:"13px",borderRadius:10,cursor:processing?"wait":"pointer",opacity:processing?0.6:1,fontFamily:"inherit",fontSize:15,fontWeight:900}}>
-                      {processing ? "⏳ Attendi…" : <>✅ Incassa {fmt(total)}</>}
-                    </button>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      )}
-
-      {/* ── SCONTRINO MOBILE ── */}
-      {view==="scontrino" && lastR && (()=>{
-        const receipts = Array.isArray(lastR) ? lastR : [lastR];
-        const r = receipts[rcptIdx];
-        const isLast = rcptIdx >= receipts.length - 1;
-        const hasMultiple = receipts.length > 1;
-        return (
-        <div style={{flex:1,overflowY:"auto",padding:16,display:"flex",flexDirection:"column",alignItems:"center"}}>
-          {hasMultiple && (
-            <div style={{width:"100%",maxWidth:320,marginBottom:12,display:"flex",gap:6}}>
-              {receipts.map((rec,i)=>(
-                <button key={i} onClick={()=>setRcptIdx(i)} style={{flex:1,padding:"8px",borderRadius:8,border:"none",cursor:"pointer",fontFamily:"inherit",fontSize:12,fontWeight:700,background:rcptIdx===i?"#dc2626":"#334155",color:"#fff"}}>
-                  {rec.centro}
-                </button>
-              ))}
-            </div>
-          )}
-          <div id="receipt-print" style={{background:"#fff",color:"#000",width:"100%",maxWidth:320,padding:20,borderRadius:8,fontFamily:"'JetBrains Mono','Courier New',monospace",fontSize:rcptCfg.fontBase,fontWeight:700}}>
-            <ReceiptBody r={r} cfg={rcptCfg} />
-          </div>
-          <div style={{display:"flex",gap:10,marginTop:16,width:"100%",maxWidth:320}}>
-            <button onClick={()=>printCurrent(r)} style={{flex:1,background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"13px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>🖨 Stampa</button>
-            {!isLast
-              ? <button onClick={()=>{setRcptIdx(rcptIdx+1);setAutoPrint(true);}} style={{flex:2,background:"#dc2626",border:"none",color:"#fff",padding:"13px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:900}}>Prossimo →</button>
-              : <button onClick={()=>setView("cassa")} style={{flex:2,background:"#15803d",border:"none",color:"#fff",padding:"13px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:900}}>➕ Nuovo Ordine</button>
-            }
-          </div>
-        </div>
-        );
-      })()}
-
-      {/* ── REPORT MOBILE ── */}
-      {view==="report" && (
-        <div style={{flex:1,overflowY:"auto",padding:"12px 10px"}}>
-          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
-            <div style={{fontSize:18,fontWeight:900,color:"#f8fafc"}}>📊 Report</div>
-            <div style={{display:"flex",gap:6}}>
-              <button onClick={exportExcel} style={{background:"#15803d",border:"none",color:"#fff",padding:"8px 14px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:13,fontWeight:700}}>📥 Excel</button>
-              <button onClick={exportPDF} style={{background:"#b91c1c",border:"none",color:"#fff",padding:"8px 14px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:13,fontWeight:700}}>📄 PDF</button>
-            </div>
-          </div>
-          {/* Selettore giornata */}
-          <div style={{marginBottom:14}}>
-            <select value={reportDay} onChange={e=>setReportDay(e.target.value)} style={{width:"100%",background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"10px 12px",borderRadius:10,fontSize:14,fontFamily:"inherit",outline:"none"}}>
-              <option value="all">📅 Tutte le giornate</option>
-              {reportDays.map(d=><option key={d} value={d}>{d}</option>)}
-            </select>
-          </div>
-          {filtroCentriJSX}
-          {/* Stat cards */}
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
-            {[[reportDay==="all"?"Incasso":"Giornata",fmt(scopeRev),scopeO.filter(o=>!isOmaggio(o)).length+" scontrini"],["Omaggi",fmt(omaggiVal),omaggi.length+" scontrini"],["Media",scopeO.filter(o=>!isOmaggio(o)).length?fmt(scopeRev/scopeO.filter(o=>!isOmaggio(o)).length):"€0.00","per scontrino"],[EVT.totaleLabel,fmt(totalRev),ordersF.length+" scontrini"]].map(([l,v,s])=>(
-              <div key={l} style={{background:"#1e293b",borderRadius:10,padding:"12px 14px",border:"1px solid #334155",gridColumn:l===EVT.totaleLabel?"span 2":"auto"}}>
-                <div style={{fontSize:11,color:"#64748b",textTransform:"uppercase",letterSpacing:1,marginBottom:4}}>{l}</div>
-                <div style={{fontSize:22,fontWeight:900,color:"#4ade80"}}>{v}</div>
-                <div style={{fontSize:11,color:"#64748b",marginTop:2}}>{s}</div>
-              </div>
-            ))}
-          </div>
-          {/* Incasso per centro di costo */}
-          <div style={{background:"#1e293b",borderRadius:10,padding:"14px",border:"1px solid #334155",marginBottom:10}}>
-            <div style={{fontSize:14,fontWeight:700,color:"#f8fafc",marginBottom:10}}>🏭 Incasso per centro di costo</div>
-            {!centriBreak.length&&<div style={{color:"#64748b",fontSize:13}}>Nessun dato</div>}
-            {centriBreak.map(([nome,d])=>(
-              <div key={nome} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",borderBottom:"1px solid #334155"}}>
-                <span style={{flex:1,fontSize:13,fontWeight:600}}>{nome}</span>
-                <span style={{color:"#64748b",fontSize:12}}>{d.qty} pz</span>
-                <span style={{fontWeight:700,color:"#4ade80",fontSize:13,minWidth:70,textAlign:"right"}}>{fmt(d.tot)}</span>
-              </div>
-            ))}
-          </div>
-          {/* Top prodotti */}
-          <div style={{background:"#1e293b",borderRadius:10,padding:"14px",border:"1px solid #334155",marginBottom:10}}>
-            <div style={{fontSize:14,fontWeight:700,color:"#f8fafc",marginBottom:10}}>🏆 Top Prodotti</div>
-            {!topItems.length&&<div style={{color:"#64748b",fontSize:13}}>Nessun dato</div>}
-            {topItems.map(([name,qty],i)=>(
-              <div key={name} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 0",borderBottom:"1px solid #334155"}}>
-                <span style={{color:"#64748b",fontSize:12,width:20}}>#{i+1}</span>
-                <span style={{flex:1,fontSize:13}}>{name}</span>
-                <span style={{fontWeight:700,color:"#fbbf24",fontSize:13}}>{qty} pz</span>
-              </div>
-            ))}
-          </div>
-          {/* Ultimi scontrini */}
-          <div style={{background:"#1e293b",borderRadius:10,padding:"14px",border:"1px solid #334155",marginBottom:10}}>
-            <div style={{fontSize:14,fontWeight:700,color:"#f8fafc",marginBottom:10}}>🧾 Scontrini {reportDay==="all"?"(ultimi 50)":"· "+reportDay}</div>
-            {!scopeO.length&&<div style={{color:"#64748b",fontSize:13}}>Nessun ordine</div>}
-            {[...scopeO].reverse().slice(0,reportDay==="all"?50:99999).map(o=>(
-              <div key={o.id} style={{padding:"8px 0",borderBottom:"1px solid #334155"}}>
-                <div style={{display:"flex",alignItems:"center",gap:8}}>
-                  <span style={{color:"#64748b",fontSize:11}}>{String(o.id).padStart(4,"0")}</span>
-                  <div style={{flex:1}}>
-                    <div style={{fontSize:12,color:"#e2e8f0"}}>{o.date}</div>
-                    <div style={{fontSize:11,color:"#64748b",textTransform:"capitalize"}}>{o.pay} {o.table?"· "+o.table:""}</div>
-                  </div>
-                  <span style={{fontWeight:900,color:"#4ade80",fontSize:14}}>{fmt(o.total)}</span>
-                </div>
-                <div style={{display:"flex",gap:6,marginTop:6}}>
-                  <button onClick={()=>editOrder(o._orig||o)} style={{flex:1,background:"#1d4ed8",border:"none",color:"#fff",padding:"6px",borderRadius:6,cursor:"pointer",fontFamily:"inherit",fontSize:11,fontWeight:700}}>✏️ Modifica</button>
-                  <button onClick={()=>deleteOrder(o._orig||o)} style={{flex:1,background:"#7f1d1d",border:"none",color:"#fca5a5",padding:"6px",borderRadius:6,cursor:"pointer",fontFamily:"inherit",fontSize:11,fontWeight:700}}>🗑 Annulla</button>
-                </div>
-              </div>
-            ))}
-          </div>
-          <div style={{textAlign:"center",paddingBottom:20}}>
-            <button onClick={deleteAllOrders} style={{background:"#7f1d1d",border:"1px solid #991b1b",color:"#fca5a5",padding:"10px 20px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:13}}>
-              🗑 Azzera Dati
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* ── CUCINA MOBILE ── */}
-      {view==="cucina" && (
-        <div style={{flex:1,overflowY:"auto",padding:"12px 10px"}}>
-          <CucinaView comande={comande} toggleComandaItem={toggleComandaItem} evadiComanda={evadiComanda} consegnaScontrino={consegnaScontrino} deleteComanda={deleteComanda} archiviaComanda={archiviaComanda} riportaInAttesa={riportaInAttesa} svuotaStorico={svuotaStorico} isMobile={true} />
-        </div>
-      )}
-
-      {/* ── ARTICOLI MOBILE ── */}
-      {view==="articoli" && (
-        <div style={{flex:1,overflowY:"auto",padding:"12px 10px"}}>
-          <ArticoliManager menu={menu} saveMenu={saveMenu} centri={centri} saveCentri={saveCentri} isMobile={true} />
-        </div>
-      )}
-
-      {/* ── IMPOSTAZIONI MOBILE ── */}
-      {view==="impostazioni" && (
-        <div style={{flex:1,overflowY:"auto",padding:"12px 10px"}}>
-          <div style={{fontSize:18,fontWeight:900,color:"#f8fafc",marginBottom:14}}>⚙️ Impostazioni</div>
-          <AdattaSchermo />
-          <SceltaStampante />
-          <div style={{background:"#1e293b",borderRadius:10,padding:14,border:"1px solid #334155",marginBottom:10}}>
-            <div style={{fontSize:14,fontWeight:700,color:"#f8fafc",marginBottom:10}}>🖨️ Rotolo Termico 80mm</div>
-            {[["1️⃣","Collega la stampante termica via USB"],["2️⃣","Installa i driver dal sito del produttore"],["3️⃣","Impostala come stampante predefinita in Windows"],["4️⃣","Clicca Stampa → seleziona la termica"],["5️⃣","Imposta margini = Nessuno, scala = 100%"],["6️⃣","Salva come impostazioni predefinite"]].map(([n,t])=>(
-              <div key={n} style={{display:"flex",gap:10,padding:"8px 0",borderBottom:"1px solid #334155"}}>
-                <span style={{fontSize:16,flexShrink:0}}>{n}</span>
-                <span style={{fontSize:12,color:"#cbd5e1",lineHeight:1.5}}>{t}</span>
-              </div>
-            ))}
-          </div>
-          <button onClick={anteprimaScontrino} style={{width:"100%",background:"#1d4ed8",border:"1px solid #3b82f6",color:"#fff",padding:14,borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>
-            🖨️ Scontrino di Prova
-          </button>
-          <ScontrinoConfig cfg={rcptCfg} save={saveRcptCfg} reset={resetRcptCfg} anteprima={anteprimaScontrino} centri={centri} saveCentri={saveCentri} isMobile={true} />
-          <FirebaseConfig syncStatus={syncStatus} />
-        </div>
-      )}
+      {contenutoPagina}
     </div>
   );
 
-  /* ── DESKTOP LAYOUT (invariato) ── */
+  /* ── DESKTOP LAYOUT ── */
   return (
     <div className="app-shell" style={{background:"#0f172a",color:"#e2e8f0",fontFamily:"inherit",display:"flex",flexDirection:"column",overflow:"hidden"}}>
       {/* Microstampa nascosta per apertura cassetto */}
       <div id="drawer-print" style={{position:"fixed",left:"-9999px",top:0,visibility:"hidden",textAlign:"center",fontFamily:"'JetBrains Mono','Courier New',monospace",fontSize:12,fontWeight:700}}>APERTURA CASSETTO</div>
 
-      {/* MODAL SELETTORE VARIANTI */}
-      {variantPick && (
-        <div onClick={()=>setVariantPick(null)} style={{position:"fixed",top:0,left:0,right:0,bottom:0,background:"rgba(0,0,0,0.75)",zIndex:9999,display:"flex",alignItems:"center",justifyContent:"center",padding:16}}>
-          <div onClick={e=>e.stopPropagation()} style={{background:"#1e293b",border:"1px solid #334155",borderRadius:16,padding:20,maxWidth:380,width:"100%",maxHeight:"calc(var(--app-h, 100dvh) - 28px)",display:"flex",flexDirection:"column",boxShadow:"0 20px 60px rgba(0,0,0,0.5)"}}>
-            <div style={{fontSize:18,fontWeight:800,color:"#f8fafc",marginBottom:6,letterSpacing:"-0.3px",flexShrink:0}}>{variantPick.name}</div>
-            <div style={{fontSize:13,color:"#94a3b8",marginBottom:16,flexShrink:0}}>Scegli le opzioni — puoi selezionarne più di una, poi premi Fatto</div>
-            <div style={{display:"flex",flexDirection:"column",gap:10,overflowY:"auto",minHeight:0,flex:"1 1 auto",margin:"0 -4px",padding:"4px"}}>
-              {variantPick.variants.map(v => {
-                const on = variantSel.includes(v);
-                return (
-                  <button key={v} onClick={()=>toggleVariant(v)} style={{background:on?"#7f1d1d":"#0f172a",border:"1px solid "+(on?"#dc2626":"#334155"),color:on?"#fff":"#e2e8f0",padding:"14px 16px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:15,fontWeight:600,textAlign:"left",display:"flex",alignItems:"center",justifyContent:"space-between",gap:10}}>
-                    <span>{v}</span>
-                    <span style={{fontSize:16,opacity:on?1:0.3}}>{on?"\u2713":"\u25cb"}</span>
-                  </button>
-                );
-              })}
-            </div>
-            <div style={{display:"flex",gap:10,marginTop:16,flexShrink:0}}>
-              <button onClick={()=>{setVariantPick(null);setVariantSel([]);}} style={{flex:1,background:"transparent",border:"1px solid #334155",color:"#94a3b8",padding:"12px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:14}}>
-                Annulla
-              </button>
-              <button onClick={confirmVariants} style={{flex:2,background:"#dc2626",border:"none",color:"#fff",padding:"12px",borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:15,fontWeight:700}}>
-                {"\u2713 Fatto"}{variantSel.length>0?" ("+variantSel.length+")":""}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-      {/* MODALE NOTA PIZZA */}
-      {noteModalJSX}
+      <ModaliCassa cassa={cassa} />
 
       <nav className="topnav" style={{background:"#1e293b",padding:"12px 24px",display:"flex",alignItems:"center",gap:16,borderBottom:"1px solid #334155",flexWrap:"wrap",flexShrink:0}}>
         <div className="brand" style={{fontSize:19,fontWeight:800,color:"#f8fafc",marginRight:8,letterSpacing:"-0.4px",display:"flex",alignItems:"center",gap:9}}><Logo size={32}/>{EVT.nomeLungo}</div>
         <div style={{display:"flex",gap:8}}>
-          {[["cassa","🧾 Cassa"],["cucina","🧑‍🍳 Cucina"],["report","📊 Report"],["articoli","🍔 Articoli"],["impostazioni","⚙️ Impostazioni"]].map(([v,label])=>(
+          {PAGINE.filter(p=>!p.nascosta).map(({id:v,icona,nome})=>(
             <button key={v} onClick={()=>setView(v)} style={{background:view===v?"#dc2626":"transparent",border:`1px solid ${view===v?"#dc2626":"#334155"}`,color:view===v?"#fff":"#94a3b8",padding:"6px 14px",borderRadius:8,cursor:"pointer",fontSize:12,fontFamily:"inherit"}}>
-              {label}
+              {icona+" "+nome}
             </button>
           ))}
         </div>
@@ -1824,254 +2142,7 @@ function POS({ theme, toggleTheme }) {
 
       {flash&&<div style={{position:"fixed",top:70,left:"50%",transform:"translateX(-50%)",background:"#22c55e",color:"#fff",padding:"8px 24px",borderRadius:20,fontWeight:700,zIndex:999,fontSize:14,pointerEvents:"none"}}>{flash}</div>}
 
-      {view==="cassa"&&(
-        <div style={{display:"flex",flex:1,minHeight:0,overflow:"hidden"}}>
-          <div style={{flex:1,display:"flex",flexDirection:"column",padding:16,overflow:"hidden",borderRight:"1px solid #1e293b",gap:10}}>
-            <input value={search} onChange={e=>setSearch(e.target.value)} placeholder="🔍 Cerca prodotto..." style={{width:"100%",background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"8px 14px",borderRadius:8,fontSize:14,fontFamily:"inherit",outline:"none"}} />
-            <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-              <button onClick={()=>setCat("Tutti")} style={{background:cat==="Tutti"?"#dc2626":"#1e293b",border:`1px solid ${cat==="Tutti"?"#dc2626":"#334155"}`,color:cat==="Tutti"?"#fff":"#94a3b8",padding:"6px 14px",borderRadius:20,cursor:"pointer",fontSize:13,fontWeight:700,fontFamily:"inherit"}}>🔍 Tutti</button>
-              {modoSemplice && catsConArticoli.map(c=>(
-                <button key={c} onClick={()=>setCat(c)} style={{background:cat===c?"#dc2626":"#1e293b",border:`1px solid ${cat===c?"#dc2626":"#334155"}`,color:cat===c?"#fff":"#94a3b8",padding:"6px 14px",borderRadius:20,cursor:"pointer",fontSize:13,fontWeight:700,fontFamily:"inherit"}}>{c}</button>
-              ))}
-              {!modoSemplice && centriConArticoli.map(c=>{
-                const on = centroSelezionato && centroSelezionato.id === c.id;
-                return (
-                  <button key={c.id} onClick={()=>setCat("c:"+c.id)} style={{background:on?"#dc2626":"#1e293b",border:`1px solid ${on?"#dc2626":"#334155"}`,color:on?"#fff":"#94a3b8",padding:"6px 14px",borderRadius:20,cursor:"pointer",fontSize:13,fontWeight:700,fontFamily:"inherit"}}>
-                    <span style={{fontSize:15,marginRight:5}}>{c.emoji}</span>{c.nome}
-                  </button>
-                );
-              })}
-            </div>
-            {!modoSemplice && sottoCategorie.length > 0 && (
-              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
-                <button onClick={()=>setCat("c:"+centroSelezionato.id)} style={{background:String(cat).startsWith("c:")?"#7f1d1d":"transparent",border:"1px solid #334155",color:String(cat).startsWith("c:")?"#fff":"#64748b",padding:"4px 12px",borderRadius:16,cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>Tutto {centroSelezionato.nome}</button>
-                {sottoCategorie.map(sc=>(
-                  <button key={sc} onClick={()=>setCat(sc)} style={{background:cat===sc?"#7f1d1d":"transparent",border:`1px solid ${cat===sc?"#dc2626":"#334155"}`,color:cat===sc?"#fff":"#64748b",padding:"4px 12px",borderRadius:16,cursor:"pointer",fontSize:11,fontFamily:"inherit"}}>{sc}</button>
-                ))}
-              </div>
-            )}
-            <div className="scroll-y" style={{flex:"1 1 0"}}>
-              {!filtered.length && <div style={{textAlign:"center",color:"#475569",padding:"40px 0",fontSize:15}}>Nessun articolo</div>}
-              {gruppiGriglia.map(g=>(
-                <div key={g.key} style={{marginBottom:18}}>
-                  {g.titolo && (
-                    <div style={{display:"flex",alignItems:"center",gap:10,margin:"4px 2px 10px"}}>
-                      <div style={{fontSize:13,fontWeight:800,color:"#94a3b8",letterSpacing:0.4,whiteSpace:"nowrap"}}>{g.titolo}</div>
-                      <div style={{flex:1,height:1,background:"#1e293b"}}/>
-                      <div style={{fontSize:11,color:"#475569"}}>{g.items.length}</div>
-                    </div>
-                  )}
-                  <div className="prod-grid" style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(130px,1fr))",gap:10}}>
-                    {g.items.map(item=>(
-                      <button key={item.id} onClick={()=>addItem(item)} className="prod-tile" style={{background:"#1e293b",border:"1px solid #334155",borderRadius:10,padding:"14px 10px",cursor:"pointer",textAlign:"center",color:"#e2e8f0",fontFamily:"inherit"}}>
-                        <div style={{fontSize:12,fontWeight:600,marginBottom:6,lineHeight:1.3}}>{item.name}</div>
-                        <div style={{fontSize:15,color:"#f87171",fontWeight:800}}>{fmt(item.price)}</div>
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-          <div className="cart-col" style={{width:"clamp(272px, 26vw, 360px)",flexShrink:0,background:"#131f30"}}>
-            <div className="cart-head" style={{padding:"14px 16px 10px",borderBottom:"1px solid #1e293b",flexShrink:0}}>
-              <span style={{fontSize:18,fontWeight:800,color:"#f8fafc"}}>🛒 Ordine</span>
-              <input value={table} onChange={e=>setTable(e.target.value)} placeholder="Nome cliente (solo se c'è cibo)" style={{width:"100%",background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"6px 10px",borderRadius:6,fontSize:13,fontFamily:"inherit",outline:"none",marginTop:8}} />
-            </div>
-            <div className="scroll-y" style={{flex:"1 1 0",minHeight:0,padding:"8px 12px"}}>
-              {!cart.length&&<div style={{textAlign:"center",color:"#475569",padding:"40px 0",fontSize:15}}>Nessun articolo<br/><span style={{fontSize:32}}>🛒</span></div>}
-              {cart.map(item=>(
-                <div key={item.id} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0",borderBottom:"1px solid #1e293b"}}>
-                  <div style={{flex:1,lineHeight:1.3}}>
-                    <div style={{fontSize:12,color:"#cbd5e1"}}>{item.name}</div>
-                    {item.note && <div style={{fontSize:11,color:"#fbbf24",fontStyle:"italic",marginTop:2}}>📝 {item.note}</div>}
-                  </div>
-                  <div style={{display:"flex",alignItems:"center",gap:4}}>
-                    <button onClick={()=>remItem(item.id)} style={{background:"#334155",border:"none",color:"#e2e8f0",width:26,height:26,borderRadius:6,cursor:"pointer",fontSize:16,fontFamily:"inherit"}}>−</button>
-                    <span style={{width:22,textAlign:"center",fontWeight:700,fontSize:14}}>{item.qty}</span>
-                    <button onClick={()=>addItem(item)} style={{background:"#334155",border:"none",color:"#e2e8f0",width:26,height:26,borderRadius:6,cursor:"pointer",fontSize:16,fontFamily:"inherit"}}>+</button>
-                  </div>
-                  <div style={{fontSize:14,fontWeight:700,color:"#f87171",minWidth:60,textAlign:"right"}}>{fmt(item.price*item.qty)}</div>
-                </div>
-              ))}
-            </div>
-            <div className="cart-footer" style={{padding:"10px 14px calc(10px + env(safe-area-inset-bottom))",borderTop:"1px solid #1e293b",flexShrink:0,background:"#131f30",maxHeight:"62%",overflowY:"auto",display:"flex",flexDirection:"column"}}>
-              <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:6,flexShrink:0}}>
-                <span style={{color:"#94a3b8",fontSize:13}}>Sconto %</span>
-                <input type="number" min="0" max="100" value={disc} onChange={e=>setDisc(Math.min(100,Math.max(0,+e.target.value)))} style={{background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"4px 8px",borderRadius:6,width:60,textAlign:"center",fontSize:14,fontFamily:"inherit",outline:"none"}} />
-              </div>
-              {disc>0&&<div style={{display:"flex",justifyContent:"space-between",padding:"4px 0",fontSize:14}}><span style={{color:"#94a3b8"}}>Subtotale</span><span>{fmt(subtotal)}</span></div>}
-              {disc>0&&<div style={{display:"flex",justifyContent:"space-between",padding:"4px 0",fontSize:14}}><span style={{color:"#f87171"}}>Sconto -{disc}%</span><span style={{color:"#f87171"}}>−{fmt(discAmt)}</span></div>}
-              <div className="cart-tot" style={{display:"flex",justifyContent:"space-between",padding:"4px 0",fontSize:22,fontWeight:900,color:"#4ade80",margin:"8px 0",flexShrink:0}}><span>TOTALE</span><span>{fmt(total)}</span></div>
-              <div className="pay-grid" style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:6,margin:"10px 0",flexShrink:0}}>
-                {PAGAMENTI.map(([m,ic])=>(
-                  <button key={m} onClick={()=>setPay(m)} style={{background:pay===m?"#991b1b":"#1e293b",border:`1px solid ${pay===m?"#dc2626":"#334155"}`,color:pay===m?"#fff":"#94a3b8",padding:"7px 4px",borderRadius:8,cursor:"pointer",fontSize:12,fontFamily:"inherit",textTransform:"capitalize"}}>{ic} {m}</button>
-                ))}
-              </div>
-              {/* Barra azioni: sta DENTRO la colonna (niente position:fixed) ed
-                  e' sticky in fondo. Cosi' il tasto Incassa resta sempre
-                  visibile e cliccabile su qualunque schermo, zoom o scalatura. */}
-              <div className="act-bar" style={{display:"flex",gap:8,flexShrink:0,paddingTop:4,background:"#131f30"}}>
-                <button onClick={clearCart} style={{flex:1,background:"#7f1d1d",border:"none",color:"#fca5a5",padding:"11px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:13}}>🗑 Cancella</button>
-                <button onClick={checkout} disabled={!cart.length || processing} style={{flex:2,background:processing?"#166534":"#15803d",border:"none",color:"#fff",padding:"11px",borderRadius:8,cursor:processing?"wait":"pointer",opacity:processing?0.6:1,fontFamily:"inherit",fontSize:14,fontWeight:800}}>{processing ? "⏳ Attendi…" : <>✅ Incassa {fmt(total)}</>}</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {view==="scontrino"&&lastR&&(()=>{
-        const receipts = Array.isArray(lastR) ? lastR : [lastR];
-        const r = receipts[rcptIdx];
-        const isLast = rcptIdx >= receipts.length - 1;
-        const hasMultiple = receipts.length > 1;
-        return (
-        <div style={{display:"flex",flexDirection:"column",alignItems:"center",padding:32,flex:1,minHeight:0,overflowY:"auto"}}>
-          {hasMultiple && (
-            <div style={{display:"flex",gap:8,marginBottom:16}}>
-              {receipts.map((rec,i)=>(
-                <button key={i} onClick={()=>setRcptIdx(i)} style={{padding:"8px 20px",borderRadius:8,border:"none",cursor:"pointer",fontFamily:"inherit",fontSize:13,fontWeight:700,background:rcptIdx===i?"#dc2626":"#334155",color:"#fff"}}>
-                  {rec.centro}
-                </button>
-              ))}
-            </div>
-          )}
-          <div id="receipt-print" style={{background:"#fff",color:"#000",width:280,padding:20,borderRadius:4,boxShadow:"0 8px 40px rgba(0,0,0,0.5)",fontFamily:"'JetBrains Mono','Courier New',monospace",fontSize:rcptCfg.fontBase,fontWeight:700}}>
-            <ReceiptBody r={r} cfg={rcptCfg} />
-          </div>
-          <div style={{display:"flex",gap:12,marginTop:24,flexWrap:"wrap",justifyContent:"center"}}>
-            <button onClick={()=>printCurrent(r)} style={{background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"10px 24px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:14}}>🖨 Stampa</button>
-            {!isLast
-              ? <button onClick={()=>{setRcptIdx(rcptIdx+1);setAutoPrint(true);}} style={{background:"#dc2626",border:"none",color:"#fff",padding:"10px 24px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>Prossimo → {receipts[rcptIdx+1].centro}</button>
-              : <button onClick={()=>setView("cassa")} style={{background:"#15803d",border:"none",color:"#fff",padding:"10px 24px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>➕ Nuovo Ordine</button>
-            }
-          </div>
-        </div>
-        );
-      })()}
-
-      {view==="report"&&(
-        <div style={{padding:24,maxWidth:1000,margin:"0 auto",width:"100%",overflowY:"auto",flex:1,minHeight:0}}>
-          <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:24,flexWrap:"wrap",gap:12}}>
-            <h2 style={{fontSize:24,fontWeight:900,color:"#f8fafc"}}>📊 Report & Statistiche</h2>
-            <div style={{display:"flex",alignItems:"center",gap:12}}>
-              <select value={reportDay} onChange={e=>setReportDay(e.target.value)} style={{background:"#1e293b",border:"1px solid #334155",color:"#e2e8f0",padding:"10px 14px",borderRadius:8,fontSize:14,fontFamily:"inherit",outline:"none",cursor:"pointer"}}>
-                <option value="all">📅 Tutte le giornate</option>
-                {reportDays.map(d=><option key={d} value={d}>{d}</option>)}
-              </select>
-              <button onClick={exportExcel} style={{background:"#15803d",border:"1px solid #16a34a",color:"#fff",padding:"10px 20px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>📥 Scarica Excel</button>
-              <button onClick={exportPDF} style={{background:"#b91c1c",border:"1px solid #dc2626",color:"#fff",padding:"10px 20px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>📄 Scarica PDF</button>
-            </div>
-          </div>
-          {filtroCentriJSX}
-          <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:16,marginBottom:24}}>
-            {[[reportDay==="all"?"Incasso totale":"Incasso giornata",fmt(scopeRev),scopeO.filter(o=>!isOmaggio(o)).length+" scontrini"],["Omaggi",fmt(omaggiVal),omaggi.length+" scontrini"],["Scontrino medio",scopeO.filter(o=>!isOmaggio(o)).length?fmt(scopeRev/scopeO.filter(o=>!isOmaggio(o)).length):"€0.00","media"],[EVT.totaleLabel,fmt(totalRev),ordersF.length+" scontrini totali"]].map(([l,v,s])=>(
-              <div key={l} style={{background:"#1e293b",borderRadius:12,padding:20,border:"1px solid #334155"}}>
-                <div style={{fontSize:12,color:"#64748b",marginBottom:6,textTransform:"uppercase",letterSpacing:1}}>{l}</div>
-                <div style={{fontSize:28,fontWeight:900,color:"#4ade80"}}>{v}</div>
-                <div style={{fontSize:12,color:"#64748b",marginTop:4}}>{s}</div>
-              </div>
-            ))}
-          </div>
-          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:16}}>
-            <div style={{background:"#1e293b",borderRadius:12,padding:20,border:"1px solid #334155"}}>
-              <h3 style={{fontSize:15,fontWeight:700,marginBottom:14,color:"#f8fafc"}}>💳 Metodi di Pagamento</h3>
-              {!Object.keys(payBreak).length&&<p style={{color:"#64748b"}}>Nessun dato</p>}
-              {Object.entries(payBreak).map(([m,v])=>(
-                <div key={m} style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
-                  <span style={{textTransform:"capitalize",minWidth:70}}>{m}</span>
-                  <div style={{flex:1,height:8,background:"#334155",borderRadius:4,overflow:"hidden"}}><div style={{height:"100%",background:"#dc2626",borderRadius:4,width:`${(v/(scopeRev||1)*100).toFixed(0)}%`,minWidth:4}}/></div>
-                  <span style={{fontWeight:700,color:"#f87171",minWidth:70,textAlign:"right"}}>{fmt(v)}</span>
-                </div>
-              ))}
-            </div>
-            <div style={{background:"#1e293b",borderRadius:12,padding:20,border:"1px solid #334155"}}>
-              <h3 style={{fontSize:15,fontWeight:700,marginBottom:14,color:"#f8fafc"}}>🏆 Top 5 Prodotti</h3>
-              {!topItems.length&&<p style={{color:"#64748b"}}>Nessun dato</p>}
-              {topItems.map(([name,qty],i)=>(
-                <div key={name} style={{display:"flex",gap:10,padding:"6px 0",borderBottom:"1px solid #334155",alignItems:"center"}}>
-                  <span style={{color:"#64748b",width:24}}>#{i+1}</span>
-                  <span style={{flex:1}}>{name}</span>
-                  <span style={{fontWeight:700,color:"#fbbf24"}}>{qty} pz</span>
-                </div>
-              ))}
-            </div>
-          </div>
-          <div style={{background:"#1e293b",borderRadius:12,padding:20,border:"1px solid #334155",marginBottom:16}}>
-            <h3 style={{fontSize:15,fontWeight:700,marginBottom:14,color:"#f8fafc"}}>🏭 Incasso per centro di costo</h3>
-            {!centriBreak.length&&<p style={{color:"#64748b"}}>Nessun dato</p>}
-            {centriBreak.map(([nome,d])=>(
-              <div key={nome} style={{display:"flex",alignItems:"center",gap:10,marginBottom:10}}>
-                <span style={{minWidth:160,fontWeight:600}}>{nome}</span>
-                <span style={{color:"#64748b",fontSize:12,minWidth:70}}>{d.qty} pz</span>
-                <div style={{flex:1,height:8,background:"#334155",borderRadius:4,overflow:"hidden"}}><div style={{height:"100%",background:"#0ea5e9",borderRadius:4,width:`${(d.tot/(scopeRev||1)*100).toFixed(0)}%`,minWidth:4}}/></div>
-                <span style={{color:"#64748b",fontSize:12,minWidth:50,textAlign:"right"}}>{(d.tot/(scopeRev||1)*100).toFixed(1)}%</span>
-                <span style={{fontWeight:700,color:"#4ade80",minWidth:80,textAlign:"right"}}>{fmt(d.tot)}</span>
-              </div>
-            ))}
-          </div>
-          <div style={{background:"#1e293b",borderRadius:12,padding:20,border:"1px solid #334155",marginBottom:16}}>
-            <h3 style={{fontSize:15,fontWeight:700,marginBottom:14,color:"#f8fafc"}}>🧾 Scontrini {reportDay==="all"?"(ultimi 50)":"· "+reportDay}</h3>
-            {!scopeO.length&&<p style={{color:"#64748b"}}>Nessun ordine</p>}
-            <div style={{overflowX:"auto"}}>
-              <div style={{display:"grid",gridTemplateColumns:"50px 1fr 80px 40px 90px 80px 80px",gap:8,padding:"8px 0",color:"#64748b",borderBottom:"1px solid #334155",fontSize:11,textTransform:"uppercase"}}>
-                <span>#</span><span>Data</span><span>Tavolo</span><span>Art.</span><span>Pagamento</span><span>Totale</span><span>Azioni</span>
-              </div>
-              {[...scopeO].reverse().slice(0,reportDay==="all"?50:99999).map(o=>(
-                <div key={o.id} style={{display:"grid",gridTemplateColumns:"50px 1fr 80px 40px 90px 80px 80px",gap:8,padding:"8px 0",borderBottom:"1px solid #1e293b",alignItems:"center",fontSize:13}}>
-                  <span style={{color:"#64748b"}}>{String(o.id).padStart(4,"0")}</span>
-                  <span style={{fontSize:12,color:"#94a3b8"}}>{o.date}</span>
-                  <span>{o.table||"—"}</span>
-                  <span>{o.items.reduce((s,i)=>s+i.qty,0)}</span>
-                  <span style={{textTransform:"capitalize",color:"#38bdf8"}}>{o.pay}</span>
-                  <span style={{fontWeight:700,color:"#4ade80"}}>{fmt(o.total)}</span>
-                  <div style={{display:"flex",gap:4}}>
-                    <button onClick={()=>editOrder(o._orig||o)} title="Modifica" style={{background:"#1d4ed8",border:"none",color:"#fff",padding:"4px 8px",borderRadius:6,cursor:"pointer",fontSize:12}}>✏️</button>
-                    <button onClick={()=>deleteOrder(o._orig||o)} title="Annulla" style={{background:"#7f1d1d",border:"none",color:"#fca5a5",padding:"4px 8px",borderRadius:6,cursor:"pointer",fontSize:12}}>🗑</button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-          <div style={{textAlign:"center",marginTop:16}}>
-            <button onClick={deleteAllOrders} style={{background:"#7f1d1d",border:"1px solid #991b1b",color:"#fca5a5",padding:"8px 20px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:13}}>🗑 Azzera Tutti i Dati</button>
-          </div>
-        </div>
-      )}
-
-      {view==="cucina"&&(
-        <div style={{padding:24,maxWidth:1000,margin:"0 auto",width:"100%",overflowY:"auto",flex:1,minHeight:0}}>
-          <CucinaView comande={comande} toggleComandaItem={toggleComandaItem} evadiComanda={evadiComanda} consegnaScontrino={consegnaScontrino} deleteComanda={deleteComanda} archiviaComanda={archiviaComanda} riportaInAttesa={riportaInAttesa} svuotaStorico={svuotaStorico} isMobile={false} />
-        </div>
-      )}
-
-      {view==="articoli"&&(
-        <div style={{padding:24,maxWidth:1000,margin:"0 auto",width:"100%",overflowY:"auto",flex:1,minHeight:0}}>
-          <ArticoliManager menu={menu} saveMenu={saveMenu} centri={centri} saveCentri={saveCentri} isMobile={false} />
-        </div>
-      )}
-
-      {view==="impostazioni"&&(
-        <div style={{padding:24,maxWidth:1000,margin:"0 auto",width:"100%",overflowY:"auto",flex:1,minHeight:0}}>
-          <h2 style={{fontSize:24,fontWeight:900,marginBottom:24,color:"#f8fafc"}}>⚙️ Impostazioni</h2>
-          <AdattaSchermo />
-          <SceltaStampante />
-          <div style={{background:"#1e293b",borderRadius:12,padding:20,border:"1px solid #334155",marginBottom:16}}>
-            <h3 style={{fontSize:15,fontWeight:700,marginBottom:14,color:"#f8fafc"}}>🖨️ Rotolo Termico 80mm</h3>
-            <div style={{display:"flex",flexDirection:"column",gap:10}}>
-              {[["1️⃣","Collega la stampante termica al PC via USB"],["2️⃣","Installa i driver dal sito del produttore"],["3️⃣","Impostala come stampante predefinita in Windows"],["4️⃣","Clicca Stampa → seleziona la stampante termica"],["5️⃣","Imposta: Margini = Nessuno · Scala = 100%"],["6️⃣","Salva queste impostazioni come predefinite"]].map(([n,t])=>(
-                <div key={n} style={{display:"flex",gap:14,background:"#0f172a",borderRadius:8,padding:"12px 16px",alignItems:"flex-start"}}>
-                  <span style={{fontSize:18,flexShrink:0}}>{n}</span>
-                  <span style={{fontSize:13,color:"#cbd5e1",lineHeight:1.6}}>{t}</span>
-                </div>
-              ))}
-            </div>
-          </div>
-          <button onClick={anteprimaScontrino} style={{background:"#1d4ed8",border:"1px solid #3b82f6",color:"#fff",padding:"10px 24px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>🖨️ Scontrino di Prova</button>
-          <ScontrinoConfig cfg={rcptCfg} save={saveRcptCfg} reset={resetRcptCfg} anteprima={anteprimaScontrino} centri={centri} saveCentri={saveCentri} isMobile={false} />
-          <FirebaseConfig syncStatus={syncStatus} />
-        </div>
-      )}
+      {contenutoPagina}
     </div>
   );
 }
@@ -3410,6 +3481,19 @@ function FirebaseConfig({ syncStatus }) {
     </div>
   );
 }
+
+/* ══ REGISTRO DELLE PAGINE ══
+   Da qui nasce la barra di navigazione, uguale su telefono e computer.
+     viste     = valori di "view" serviti dalla pagina
+     nascosta  = pagina raggiungibile solo dal programma, senza voce in barra */
+const PAGINE = [
+  { id:"cassa",        icona:"🧾",   nome:"Cassa",        viste:["cassa","carrello"], Componente:PaginaCassa },
+  { id:"cucina",       icona:"🧑‍🍳", nome:"Cucina",       viste:["cucina"],           Componente:PaginaCucina },
+  { id:"report",       icona:"📊",   nome:"Report",       viste:["report"],           Componente:PaginaReport },
+  { id:"articoli",     icona:"🍔",   nome:"Articoli",     viste:["articoli"],         Componente:PaginaArticoli },
+  { id:"impostazioni", icona:"⚙️",   nome:"Impostazioni", viste:["impostazioni"],     Componente:PaginaImpostazioni },
+  { id:"scontrino",    viste:["scontrino"], Componente:PaginaScontrino, nascosta:true },
+];
 
 function App() {
   const [authed, setAuthed] = useState(()=>sessionStorage.getItem(EVENT_PREFIX+"auth")==="1");
