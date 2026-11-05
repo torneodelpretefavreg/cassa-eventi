@@ -29,7 +29,8 @@
        la pagina: cosi' nessuna operazione in corso puo' finire nell'evento
        sbagliato. Firebase, tema e accesso appartengono invece al dispositivo. */
     const CONFIG_PREFIX   = "fest_";
-    const CHIAVE_EVENTO   = "cassa_evento_attivo";   // evento scelto su questo dispositivo
+    const CHIAVE_EVENTO   = "cassa_evento_attivo";   // ultimo evento usato su questo dispositivo
+    const CHIAVE_SESSIONE = "cassa_evento_sessione"; // evento aperto in questa sessione
     const CHIAVE_REGISTRO = "cassa_eventi";          // copia locale dell'elenco eventi
     const RAMO_REGISTRO   = "cassa/registro";        // elenco eventi su Firebase
     const EVENTO_BASE     = "festival";
@@ -3867,7 +3868,7 @@ function CartaEvento({ apriEventi }) {
 /* ── GESTIONE EVENTI ──
    Sta sopra la cassa senza smontarla: chiudendola, il carrello è ancora lì.
    obbligatoria = non c'è un evento da aprire, quindi va fatta una scelta. */
-function GestioneEventi({ registro, obbligatoria, carrelloPieno, onChiudi, onScelto }) {
+function GestioneEventi({ registro, obbligatoria, carrelloPieno, nuovoEvento, onChiudi, onScelto, onIndietro }) {
   const { reg, eventi, salvaVoce } = registro;
   const [nome, setNome]       = useState("");
   const [origine, setOrigine] = useState("");
@@ -3892,14 +3893,11 @@ function GestioneEventi({ registro, obbligatoria, carrelloPieno, onChiudi, onSce
   };
 
   const apri = (ev) => {
-    if (ev.id === EVENTO_ID) {
-      localStorage.setItem(CHIAVE_EVENTO, ev.id);
-      onScelto();
-      return;
-    }
-    if (carrelloPieno && !window.confirm("L'ordine aperto andrà perso. Cambiare evento?")) return;
+    if (ev.id !== EVENTO_ID && carrelloPieno && !window.confirm("L'ordine aperto andrà perso. Cambiare evento?")) return;
     localStorage.setItem(CHIAVE_EVENTO, ev.id);
-    window.location.reload();
+    sessionStorage.setItem(CHIAVE_SESSIONE, ev.id);
+    if (ev.id === EVENTO_ID) onScelto();
+    else window.location.reload();
   };
 
   const crea = () => esegui(async () => {
@@ -3947,7 +3945,7 @@ function GestioneEventi({ registro, obbligatoria, carrelloPieno, onChiudi, onSce
   const backup = (ev) => esegui(() => scaricaBackup(ev), "Backup non riuscito.");
 
   const archivia = (ev) => {
-    if (ev.id === EVENTO_ID) { setErrore("Questo evento è aperto qui: apri prima un altro evento."); return; }
+    if (ev.id === EVENTO_ID && !obbligatoria) { setErrore("Questo evento è aperto qui: apri prima un altro evento."); return; }
     if (!window.confirm("Archiviare «" + ev.nome + "»? Viene scaricato un backup e l'evento non sarà più apribile finché non lo riapri. Le casse che lo stanno usando dovranno scegliere un altro evento.")) return;
     esegui(async () => {
       await scaricaBackup(ev);
@@ -3984,10 +3982,11 @@ function GestioneEventi({ registro, obbligatoria, carrelloPieno, onChiudi, onSce
       <div style={{maxWidth:680,margin:"0 auto",padding:"16px 14px 32px"}}>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,marginBottom:16}}>
           <div>
-            <div style={{fontSize:22,fontWeight:900,color:"#f8fafc"}}>🎪 Eventi</div>
-            <div style={{fontSize:13,color:"#94a3b8"}}>{obbligatoria ? "Scegli l'evento da aprire su questo dispositivo" : "Ogni evento ha menu, incassi e impostazioni propri"}</div>
+            <div style={{fontSize:22,fontWeight:900,color:"#f8fafc"}}>{obbligatoria ? "🧾 CassaPro" : "🎪 Eventi"}</div>
+            <div style={{fontSize:13,color:"#94a3b8"}}>{obbligatoria ? "Scegli l'evento da aprire" : "Ogni evento ha menu, incassi e impostazioni propri"}</div>
           </div>
           {!obbligatoria && <button onClick={onChiudi} style={tasto("#334155")}>✕ Chiudi</button>}
+          {obbligatoria && onIndietro && <button onClick={onIndietro} style={tasto("#334155")}>← Indietro</button>}
         </div>
 
         {errore && <div style={{background:"#7f1d1d",color:"#fff",borderRadius:10,padding:"10px 12px",fontSize:13,marginBottom:12}}>{errore}</div>}
@@ -3999,9 +3998,9 @@ function GestioneEventi({ registro, obbligatoria, carrelloPieno, onChiudi, onSce
             <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
               <div style={{flex:"1 1 180px",minWidth:0}}>
                 <div style={{fontSize:16,fontWeight:800,color:"#f8fafc",overflowWrap:"anywhere"}}>{ev.nome}</div>
-                <div style={{fontSize:12,color:"#94a3b8"}}>{ev.id===EVENTO_ID ? "Aperto su questo dispositivo" : "Non aperto qui"}</div>
+                <div style={{fontSize:12,color:"#94a3b8"}}>{ev.id!==EVENTO_ID ? "Non aperto qui" : obbligatoria ? "Ultimo usato qui" : "Aperto su questo dispositivo"}</div>
               </div>
-              <button disabled={occupato} onClick={()=>apri(ev)} style={tasto("#dc2626")}>{ev.id===EVENTO_ID ? "Usa questo" : "Apri"}</button>
+              <button disabled={occupato} onClick={()=>apri(ev)} style={tasto("#dc2626")}>Apri</button>
             </div>
             {modifica === ev.id && (
               <div style={{marginTop:10}}>
@@ -4026,7 +4025,7 @@ function GestioneEventi({ registro, obbligatoria, carrelloPieno, onChiudi, onSce
 
         <div style={{...carta,marginTop:16}}>
           <div style={{fontSize:15,fontWeight:800,color:"#f8fafc",marginBottom:10}}>➕ Nuovo evento</div>
-          <input value={nome} onChange={e=>setNome(e.target.value)} placeholder="Nome dell'evento" style={campo} />
+          <input value={nome} onChange={e=>setNome(e.target.value)} placeholder="Nome dell'evento" autoFocus={!!nuovoEvento} style={campo} />
           <select value={origine} onChange={e=>setOrigine(e.target.value)} aria-label="Punto di partenza" style={{...campo,marginTop:8}}>
             <option value="">Parti da zero</option>
             {eventi.map(ev => <option key={ev.id} value={ev.id}>Copia menu e impostazioni da {ev.nome}</option>)}
@@ -4053,18 +4052,37 @@ function GestioneEventi({ registro, obbligatoria, carrelloPieno, onChiudi, onSce
   );
 }
 
+/* ── SCHERMATA INIZIALE ── Non appartiene a nessun evento */
+function SchermataIniziale({ onScegli, onNuovo }) {
+  const tasto = { width:"100%", border:"none", color:"#fff", padding:16, borderRadius:10, cursor:"pointer", fontFamily:"inherit", fontSize:16, fontWeight:800 };
+  return (
+    <div className="app-shell" style={{background:"#0f172a",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"inherit",padding:20,overflowY:"auto"}}>
+      <div style={{background:"#1e293b",border:"1px solid #334155",borderRadius:20,padding:"clamp(18px,4vh,40px) 28px",textAlign:"center",width:"100%",maxWidth:340,margin:"auto",flexShrink:0}}>
+        <div className="hide-short" style={{fontSize:64,lineHeight:1.1,marginBottom:10}}>🧾</div>
+        <div style={{fontSize:28,fontWeight:900,color:"#f8fafc",marginBottom:4,letterSpacing:"-0.5px"}}>CassaPro</div>
+        <div style={{fontSize:14,color:"#94a3b8",marginBottom:24}}>La cassa per i tuoi eventi</div>
+        <button onClick={onScegli} style={{...tasto,background:"#dc2626",marginBottom:10}}>🎪 Apri un evento</button>
+        <button onClick={onNuovo} style={{...tasto,background:"#334155"}}>➕ Nuovo evento</button>
+      </div>
+    </div>
+  );
+}
+
 function App() {
   const [authed, setAuthed] = useState(()=>sessionStorage.getItem(CONFIG_PREFIX+"auth")==="1");
   const [theme, setTheme] = useState(()=>localStorage.getItem(CONFIG_PREFIX+"theme") || "dark");
   const registro = useRegistroEventi();
-  const [scelto, setScelto] = useState(()=>localStorage.getItem(CHIAVE_EVENTO)===EVENTO_ID);
+  // Ogni nuova sessione parte dalla schermata iniziale. Ricaricare la pagina no:
+  // l'evento aperto resta aperto finché la scheda è aperta.
+  const [scelto, setScelto] = useState(()=>sessionStorage.getItem(CHIAVE_SESSIONE)===EVENTO_ID);
+  const [elenco, setElenco] = useState(null); // null | "apri" | "nuovo"
   const [gestione, setGestione] = useState(null); // null | { carrelloPieno }
 
   useEffect(()=>{
     document.documentElement.className = theme === "light" ? "light" : "";
     localStorage.setItem(CONFIG_PREFIX+"theme", theme);
   }, [theme]);
-  useEffect(()=>{ document.title = authed ? "CassaPro — " + EVT.nomeLungo : "CassaPro"; }, [registro.reg, authed]);
+  useEffect(()=>{ document.title = authed && scelto ? "CassaPro — " + EVT.nomeLungo : "CassaPro"; }, [registro.reg, authed, scelto]);
 
   const toggleTheme = ()=>setTheme(t=>t==="dark"?"light":"dark");
   const login = ()=>{sessionStorage.setItem(CONFIG_PREFIX+"auth","1");setAuthed(true);};
@@ -4072,25 +4090,23 @@ function App() {
   const attivi = registro.eventi.filter(e=>!e.archiviato);
   const apribile = attivi.some(e=>e.id===EVENTO_ID);
 
-  // Con un solo evento si entra diretto, come sempre. La scelta serve se ce ne sono
-  // più d'uno, o se l'evento aperto è stato archiviato da un altro dispositivo.
-  const scegli = registro.pronto && (!apribile || (!scelto && attivi.length > 1));
-
-  // Entrati in cassa, l'evento è fissato: creare altri eventi non deve chiudere
-  // la cassa aperta né far perdere l'ordine in corso.
-  const inCassa = authed && registro.pronto && !scegli;
-  useEffect(()=>{
-    if (inCassa && !scelto) { localStorage.setItem(CHIAVE_EVENTO, EVENTO_ID); setScelto(true); }
-  }, [inCassa, scelto]);
+  // Si entra in cassa solo da un evento scelto. Se quello aperto viene archiviato
+  // da un altro dispositivo, si torna direttamente all'elenco.
+  const scegli = registro.pronto && (!apribile || !scelto);
 
   if (!authed) return <Login onLogin={login}/>;
 
-  // In attesa dell'elenco: chi ha già un evento scelto entra subito
+  // In attesa dell'elenco: chi ha già un evento aperto entra subito
   if (!registro.pronto && !(scelto && apribile))
-    return <div className="app-shell" style={{background:"#0f172a",color:"#94a3b8",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15}}>Caricamento eventi…</div>;
+    return <div className="app-shell" style={{background:"#0f172a",color:"#94a3b8",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15}}>Caricamento…</div>;
 
-  const chiudi = ()=>{ setGestione(null); setScelto(true); };
-  if (scegli) return <GestioneEventi registro={registro} obbligatoria onScelto={chiudi} onChiudi={chiudi}/>;
+  const chiudi = ()=>{ setGestione(null); setElenco(null); setScelto(true); };
+  if (scegli) {
+    if (!scelto && !elenco)
+      return <SchermataIniziale onScegli={()=>setElenco("apri")} onNuovo={()=>setElenco("nuovo")}/>;
+    return <GestioneEventi registro={registro} obbligatoria nuovoEvento={elenco==="nuovo"} onScelto={chiudi} onChiudi={chiudi}
+                           onIndietro={scelto ? undefined : ()=>setElenco(null)}/>;
+  }
 
   return (
     <>
