@@ -72,6 +72,15 @@
     } catch(e) { console.warn("Firebase non configurato:", e); }
   </script>
   <style>
+    /* Tastierino PIN */
+    .tasto-pin { width: min(76px, 11dvh); height: min(76px, 11dvh); justify-self: center; border: none; border-radius: 50%;
+      background: rgba(148,163,184,.16); color: #f8fafc; font-family: inherit; font-size: 30px; font-weight: 400; cursor: pointer;
+      touch-action: manipulation; -webkit-tap-highlight-color: transparent; user-select: none; -webkit-user-select: none; }
+    .tasto-pin:active { background: rgba(148,163,184,.45); }
+    .tasto-pin-vuoto { background: transparent; color: #94a3b8; font-size: 24px; }
+    html.light .tasto-pin { background: rgba(15,23,42,.08); color: #0f172a; }
+    html.light .tasto-pin:active { background: rgba(15,23,42,.22); }
+    html.light .tasto-pin-vuoto { background: transparent; color: #475569; }
     * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
     html, body { height: 100%; overflow: hidden; background: #0f172a; overscroll-behavior: none; }
     /* monospace solo dove serve davvero */
@@ -478,7 +487,7 @@ let rcptN = parseInt(localStorage.getItem(EVENT_PREFIX+"rcpt_n") || "1");
    un'impronta cifrata del PIN, mai il PIN. È una comodità per chi usa la cassa:
    la protezione vera di dati e incassi dipende dalle regole di Firebase. */
 const CHIAVE_ACCESSO = CONFIG_PREFIX + "accesso";
-const LUNGHEZZA_PIN = 4, TENTATIVI_PIN = 5;
+const LUNGHEZZA_PIN = 4, TENTATIVI_PIN = 5, GIRI_PIN = 60000;
 const leggiAccesso = () => { try { return JSON.parse(localStorage.getItem(CHIAVE_ACCESSO) || "null") || {}; } catch (e) { return {}; } };
 const scriviAccesso = a => localStorage.setItem(CHIAVE_ACCESSO, JSON.stringify(a));
 
@@ -491,7 +500,7 @@ async function impronta(pin, sale, giri) {
   return inHex(await crypto.subtle.deriveBits({ name:"PBKDF2", hash:"SHA-256", salt:daHex(sale), iterations:giri }, chiave, 256));
 }
 async function nuovoPin(pin) {
-  const sale = inHex(casuali(16)), giri = 150000;
+  const sale = inHex(casuali(16)), giri = GIRI_PIN;
   return { sale, giri, hash:await impronta(pin, sale, giri) };
 }
 const pinDisponibile = () => !!(window.crypto && crypto.subtle);
@@ -545,11 +554,15 @@ function TastierinoPin({ titolo, sotto, errore, onCompleto, children }) {
   useEffect(() => {
     if (pin.length !== LUNGHEZZA_PIN) return;
     let vivo = true;
-    const t = setTimeout(async () => { await onCompleto(pin); if (vivo) setPin(""); }, 120);
+    const t = setTimeout(async () => { await onCompleto(pin); if (vivo) setPin(""); }, 40);
     return () => { vivo = false; clearTimeout(t); };
   }, [pin]);
 
-  const cifra = { height:60, background:"#334155", border:"none", borderRadius:14, color:"#fff", fontFamily:"inherit", fontSize:24, fontWeight:700, cursor:"pointer" };
+  // Il tocco vale appena il dito appoggia; il clic resta per chi usa tastiera e lettori di schermo
+  const tocco = c => ({
+    onPointerDown:e=>{ e.preventDefault(); premi(c); },
+    onClick:e=>{ if (e.detail === 0) premi(c); },
+  });
   return (
     <>
       <div style={{fontSize:21,fontWeight:800,color:"#f8fafc"}}>{titolo}</div>
@@ -558,11 +571,11 @@ function TastierinoPin({ titolo, sotto, errore, onCompleto, children }) {
         {[0,1,2,3].map(i => <span key={i} style={{width:14,height:14,borderRadius:7,border:"2px solid #94a3b8",background:i<pin.length?"#f8fafc":"transparent"}} />)}
       </div>
       <div style={{minHeight:20,fontSize:13,color:"#f87171",marginBottom:6}}>{errore}</div>
-      <div style={{display:"grid",gridTemplateColumns:"repeat(3, minmax(0, 1fr))",gap:10}}>
-        {["1","2","3","4","5","6","7","8","9"].map(c => <button key={c} onClick={()=>premi(c)} style={cifra}>{c}</button>)}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3, minmax(0, 1fr))",gap:12,maxWidth:264,margin:"0 auto"}}>
+        {["1","2","3","4","5","6","7","8","9"].map(c => <button key={c} className="tasto-pin" {...tocco(c)}>{c}</button>)}
         <span />
-        <button onClick={()=>premi("0")} style={cifra}>0</button>
-        <button aria-label="Cancella" onClick={()=>premi("del")} style={{...cifra,background:"transparent",color:"#94a3b8"}}>⌫</button>
+        <button className="tasto-pin" {...tocco("0")}>0</button>
+        <button aria-label="Cancella" className="tasto-pin tasto-pin-vuoto" {...tocco("del")}>⌫</button>
       </div>
       {children}
     </>
@@ -607,7 +620,12 @@ function Login({ onLogin }) {
   };
   const controllaPin = async pin => {
     const a = leggiAccesso();
-    if (await impronta(pin, a.sale, a.giri) === a.hash) { aggiorna({...a, errori:0}); onLogin(); return; }
+    if (await impronta(pin, a.sale, a.giri) === a.hash) {
+      // I PIN creati prima di questa versione passano al calcolo più rapido
+      aggiorna({...a, ...(a.giri > GIRI_PIN ? await nuovoPin(pin) : {}), errori:0});
+      onLogin();
+      return;
+    }
     const errori = (a.errori || 0) + 1;
     aggiorna({...a, errori});
     if (errori >= TENTATIVI_PIN) { setErrore(""); setModo("password"); }
@@ -674,6 +692,70 @@ function Login({ onLogin }) {
       </button>
       {accesso.hash && (accesso.errori||0) < TENTATIVI_PIN && <button onClick={()=>setModo("pin")} style={{...linkAccesso,marginTop:4}}>Usa il PIN</button>}
     </SchedaAccesso>
+  );
+}
+
+/* ── COLLEGAMENTO DEL DISPOSITIVO ──
+   Il collegamento a Firebase è salvato su ogni dispositivo, e l'icona sulla home di
+   iPhone ha una memoria sua, separata da Safari. Il codice evita di ricopiare a mano
+   tutti i campi. Non è scritto nel programma perché il codice è pubblico: va passato
+   solo a chi deve usare la cassa. */
+const CAMPI_FIREBASE = ["apiKey", "authDomain", "databaseURL", "projectId", "storageBucket", "messagingSenderId", "appId"];
+const codiceCollegamento = () => {
+  const cfg = {};
+  CAMPI_FIREBASE.forEach(k => { cfg[k] = localStorage.getItem(CONFIG_PREFIX + "fb_" + k) || ""; });
+  return "CP1." + btoa(JSON.stringify(cfg));
+};
+function applicaCollegamento(testo) {
+  const m = /CP1\.([A-Za-z0-9+/=]+)/.exec(String(testo));
+  if (!m) return false;
+  let cfg;
+  try { cfg = JSON.parse(atob(m[1])); } catch (e) { return false; }
+  if (!cfg || !/^https:\/\/\S+$/.test(cfg.databaseURL || "")) return false;
+  CAMPI_FIREBASE.forEach(k => {
+    if (cfg[k]) localStorage.setItem(CONFIG_PREFIX + "fb_" + k, String(cfg[k]));
+    else localStorage.removeItem(CONFIG_PREFIX + "fb_" + k);
+  });
+  return true;
+}
+
+function CollegaDispositivo() {
+  const [testo, setTesto] = useState("");
+  const [errore, setErrore] = useState(false);
+  const collega = () => {
+    if (applicaCollegamento(testo)) window.location.reload();
+    else setErrore(true);
+  };
+  return (
+    <div data-eventi style={{background:"#422006",border:"1px solid #92400e",borderRadius:12,padding:12,marginTop:14,textAlign:"left"}}>
+      <div style={{fontSize:14,fontWeight:800,color:"#fde68a"}}>Dispositivo non collegato</div>
+      <div style={{fontSize:12,color:"#fde68a",margin:"3px 0 8px"}}>Eventi e incassi restano solo qui. Incolla il codice preso da un dispositivo già collegato.</div>
+      <input aria-label="Codice di collegamento" value={testo} onChange={e=>{setTesto(e.target.value);setErrore(false);}} placeholder="Incolla il codice"
+             style={{width:"100%",boxSizing:"border-box",background:"#0f172a",border:"1px solid "+(errore?"#f87171":"#92400e"),color:"#e2e8f0",padding:11,borderRadius:8,fontSize:15,fontFamily:"inherit",outline:"none"}} />
+      {errore && <div style={{fontSize:12,color:"#fca5a5",marginTop:6}}>Codice non valido.</div>}
+      <button onClick={collega} style={{width:"100%",background:"#d97706",border:"none",color:"#fff",padding:12,borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:800,marginTop:8}}>Collega</button>
+    </div>
+  );
+}
+
+function CartaCollegamento() {
+  const [copiato, setCopiato] = useState(false);
+  const [testo, setTesto] = useState("");
+  if (!db) return <div data-eventi style={{marginBottom:14}}><CollegaDispositivo /></div>;
+  const copia = async () => {
+    const codice = codiceCollegamento();
+    try { await navigator.clipboard.writeText(codice); setCopiato(true); setTimeout(()=>setCopiato(false), 2500); }
+    catch (e) { setTesto(codice); }
+  };
+  return (
+    <div data-eventi style={{background:"#1e293b",borderRadius:12,padding:14,border:"1px solid #334155",marginBottom:14}}>
+      <div style={{fontSize:15,fontWeight:800,color:"#f8fafc"}}>🔗 Collega un altro dispositivo</div>
+      <div style={{fontSize:12,color:"#94a3b8",margin:"3px 0 10px"}}>Copia il codice e incollalo nella schermata iniziale dell'altro dispositivo. Dallo solo a chi lavora in cassa.</div>
+      <button onClick={copia} style={{background:"#334155",border:"1px solid #475569",color:"#fff",padding:"10px 12px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:13,fontWeight:700}}>
+        {copiato ? "✓ Codice copiato" : "Copia codice"}
+      </button>
+      {testo && <textarea readOnly value={testo} aria-label="Codice di collegamento" onFocus={e=>e.target.select()} style={{display:"block",width:"100%",boxSizing:"border-box",minHeight:80,marginTop:10,background:"#0f172a",border:"1px solid #334155",color:"#e2e8f0",borderRadius:8,padding:8,fontSize:12,fontFamily:"inherit"}} />}
+    </div>
   );
 }
 
@@ -2325,6 +2407,7 @@ function PaginaImpostazioni({ dati, cassa, stampa, isMobile, apriEventi }) {
       <div style={{fontSize:18,fontWeight:900,color:"#f8fafc",marginBottom:14}}>⚙️ Impostazioni</div>
       <CartaEvento apriEventi={apriEventi} />
       <EditorPagine dati={dati} />
+      <CartaCollegamento />
       <CartaAccesso carrelloPieno={cassa.cart.length > 0} />
       <AdattaSchermo />
       <SceltaStampante />
@@ -2350,6 +2433,7 @@ function PaginaImpostazioni({ dati, cassa, stampa, isMobile, apriEventi }) {
       <h2 style={{fontSize:24,fontWeight:900,marginBottom:24,color:"#f8fafc"}}>⚙️ Impostazioni</h2>
       <CartaEvento apriEventi={apriEventi} />
       <EditorPagine dati={dati} />
+      <CartaCollegamento />
       <CartaAccesso carrelloPieno={cassa.cart.length > 0} />
       <AdattaSchermo />
       <SceltaStampante />
@@ -4234,7 +4318,7 @@ function GestioneEventi({ registro, obbligatoria, carrelloPieno, nuovoEvento, on
             <div style={{display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
               <div style={{flex:"1 1 180px",minWidth:0}}>
                 <div style={{fontSize:16,fontWeight:800,color:"#f8fafc",overflowWrap:"anywhere"}}>{ev.nome}</div>
-                <div style={{fontSize:12,color:"#94a3b8"}}>{ev.id!==EVENTO_ID ? "Non aperto qui" : obbligatoria ? "Ultimo usato qui" : "Aperto su questo dispositivo"}</div>
+                <div style={{fontSize:12,color:"#94a3b8"}}>{ev.soloLocale ? "Salvato solo su questo dispositivo" : ev.id!==EVENTO_ID ? "Non aperto qui" : obbligatoria ? "Ultimo usato qui" : "Aperto su questo dispositivo"}</div>
               </div>
               <button disabled={occupato} onClick={()=>apri(ev)} style={tasto("#dc2626")}>Apri</button>
             </div>
@@ -4306,6 +4390,7 @@ function SchermataIniziale({ onScegli, onNuovo }) {
         <div style={{fontSize:14,color:"#94a3b8",marginBottom:24}}>La cassa per i tuoi eventi</div>
         <button onClick={onScegli} style={{...tasto,background:"#dc2626",marginBottom:10}}>🎪 Apri un evento</button>
         <button onClick={onNuovo} style={{...tasto,background:"#334155"}}>➕ Nuovo evento</button>
+        {!db && <CollegaDispositivo />}
       </div>
     </div>
   );
