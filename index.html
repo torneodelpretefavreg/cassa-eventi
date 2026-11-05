@@ -4,7 +4,13 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <title>CassaPro</title>
-  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧾</text></svg>">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDI0IDEwMjQiPjxyZWN0IHdpZHRoPSIxMDI0IiBoZWlnaHQ9IjEwMjQiIHJ4PSIyMjgiIGZpbGw9IiMwZjE3MmEiLz48cGF0aCBkPSJNMjUyIDIxMGg1MjBsOTIgMjQ0SDE2MHoiIGZpbGw9IiNmZmYiLz48cGF0aCBkPSJNMjUyIDIxMGgxMDRsLTMwIDI0NEgxNjB6TTQ2MCAyMTBoMTA0bDEwIDI0NEg0NTB6TTY2OCAyMTBoMTA0bDkyIDI0NEg2OTh6IiBmaWxsPSIjZGMyNjI2Ii8+PHBhdGggZD0iTTE2MCA0NTRhNzEgNzEgMCAwIDAgMTQyIDAgNzAgNzAgMCAwIDAgMTQwIDAgNzAgNzAgMCAwIDAgMTQwIDAgNzAgNzAgMCAwIDAgMTQwIDAgNzEgNzEgMCAwIDAgMTQyIDB6IiBmaWxsPSIjZmZmIi8+PHBhdGggZD0iTTE2MCA0NTRhNzEgNzEgMCAwIDAgMTQyIDB6TTQ0MiA0NTRhNzAgNzAgMCAwIDAgMTQwIDB6TTcyMiA0NTRhNzEgNzEgMCAwIDAgMTQyIDB6IiBmaWxsPSIjZGMyNjI2Ii8+PHJlY3QgeD0iMjI2IiB5PSI2MDAiIHdpZHRoPSI1NzIiIGhlaWdodD0iMjE0IiByeD0iMzAiIGZpbGw9IiNmZmYiLz48Y2lyY2xlIGN4PSI1MTIiIGN5PSI3MDciIHI9IjU4IiBmaWxsPSIjZmJiZjI0Ii8+PC9zdmc+Cg==">
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+  <link rel="manifest" href="manifest.webmanifest">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="CassaPro">
+  <meta name="application-name" content="CassaPro">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
@@ -476,7 +482,7 @@ function Login({ onLogin }) {
   return (
     <div className="app-shell" style={{background:"#0f172a",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"inherit",padding:20,overflowY:"auto"}}>
       <div style={{background:"#1e293b",border:"1px solid #334155",borderRadius:20,padding:"clamp(18px,4vh,40px) 28px",textAlign:"center",width:"100%",maxWidth:340,margin:"auto",flexShrink:0}}>
-        <div className="hide-short" style={{fontSize:64,lineHeight:1.1,marginBottom:10}}>🧾</div>
+        <LogoCassaPro size={96} className="hide-short" style={{margin:"0 auto 12px"}} />
         <div style={{fontSize:28,fontWeight:900,color:"#f8fafc",marginBottom:4,letterSpacing:"-0.5px"}}>CassaPro</div>
         <div style={{fontSize:14,color:"#94a3b8",marginBottom:4}}>La cassa per i tuoi eventi</div>
         <div style={{fontSize:13,color:"#64748b",marginBottom:24}}>Inserisci la password</div>
@@ -3982,7 +3988,7 @@ function GestioneEventi({ registro, obbligatoria, carrelloPieno, nuovoEvento, on
       <div style={{maxWidth:680,margin:"0 auto",padding:"16px 14px 32px"}}>
         <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",gap:12,marginBottom:16}}>
           <div>
-            <div style={{fontSize:22,fontWeight:900,color:"#f8fafc"}}>{obbligatoria ? "🧾 CassaPro" : "🎪 Eventi"}</div>
+            <div style={{fontSize:22,fontWeight:900,color:"#f8fafc"}}>{obbligatoria ? <span style={{display:"flex",alignItems:"center",gap:10}}><LogoCassaPro size={34} />CassaPro</span> : "🎪 Eventi"}</div>
             <div style={{fontSize:13,color:"#94a3b8"}}>{obbligatoria ? "Scegli l'evento da aprire" : "Ogni evento ha menu, incassi e impostazioni propri"}</div>
           </div>
           {!obbligatoria && <button onClick={onChiudi} style={tasto("#334155")}>✕ Chiudi</button>}
@@ -4052,13 +4058,20 @@ function GestioneEventi({ registro, obbligatoria, carrelloPieno, nuovoEvento, on
   );
 }
 
+/* Logo del programma: resta uguale in tutti gli eventi (copia di icons/cassapro.svg) */
+const LOGO_CASSAPRO = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMDI0IDEwMjQiPjxyZWN0IHdpZHRoPSIxMDI0IiBoZWlnaHQ9IjEwMjQiIHJ4PSIyMjgiIGZpbGw9IiMwZjE3MmEiLz48cGF0aCBkPSJNMjUyIDIxMGg1MjBsOTIgMjQ0SDE2MHoiIGZpbGw9IiNmZmYiLz48cGF0aCBkPSJNMjUyIDIxMGgxMDRsLTMwIDI0NEgxNjB6TTQ2MCAyMTBoMTA0bDEwIDI0NEg0NTB6TTY2OCAyMTBoMTA0bDkyIDI0NEg2OTh6IiBmaWxsPSIjZGMyNjI2Ii8+PHBhdGggZD0iTTE2MCA0NTRhNzEgNzEgMCAwIDAgMTQyIDAgNzAgNzAgMCAwIDAgMTQwIDAgNzAgNzAgMCAwIDAgMTQwIDAgNzAgNzAgMCAwIDAgMTQwIDAgNzEgNzEgMCAwIDAgMTQyIDB6IiBmaWxsPSIjZmZmIi8+PHBhdGggZD0iTTE2MCA0NTRhNzEgNzEgMCAwIDAgMTQyIDB6TTQ0MiA0NTRhNzAgNzAgMCAwIDAgMTQwIDB6TTcyMiA0NTRhNzEgNzEgMCAwIDAgMTQyIDB6IiBmaWxsPSIjZGMyNjI2Ii8+PHJlY3QgeD0iMjI2IiB5PSI2MDAiIHdpZHRoPSI1NzIiIGhlaWdodD0iMjE0IiByeD0iMzAiIGZpbGw9IiNmZmYiLz48Y2lyY2xlIGN4PSI1MTIiIGN5PSI3MDciIHI9IjU4IiBmaWxsPSIjZmJiZjI0Ii8+PC9zdmc+Cg==";
+const LogoCassaPro = ({size=64, className, style={}}) => (
+  <img src={LOGO_CASSAPRO} alt="CassaPro" width={size} height={size} className={className}
+       style={{display:"block",...style}} />
+);
+
 /* ── SCHERMATA INIZIALE ── Non appartiene a nessun evento */
 function SchermataIniziale({ onScegli, onNuovo }) {
   const tasto = { width:"100%", border:"none", color:"#fff", padding:16, borderRadius:10, cursor:"pointer", fontFamily:"inherit", fontSize:16, fontWeight:800 };
   return (
     <div className="app-shell" style={{background:"#0f172a",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"inherit",padding:20,overflowY:"auto"}}>
       <div style={{background:"#1e293b",border:"1px solid #334155",borderRadius:20,padding:"clamp(18px,4vh,40px) 28px",textAlign:"center",width:"100%",maxWidth:340,margin:"auto",flexShrink:0}}>
-        <div className="hide-short" style={{fontSize:64,lineHeight:1.1,marginBottom:10}}>🧾</div>
+        <LogoCassaPro size={96} className="hide-short" style={{margin:"0 auto 12px"}} />
         <div style={{fontSize:28,fontWeight:900,color:"#f8fafc",marginBottom:4,letterSpacing:"-0.5px"}}>CassaPro</div>
         <div style={{fontSize:14,color:"#94a3b8",marginBottom:24}}>La cassa per i tuoi eventi</div>
         <button onClick={onScegli} style={{...tasto,background:"#dc2626",marginBottom:10}}>🎪 Apri un evento</button>
