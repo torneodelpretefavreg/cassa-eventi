@@ -472,31 +472,259 @@ const giornoDi = (d) => {
 let rcptN = parseInt(localStorage.getItem(EVENT_PREFIX+"rcpt_n") || "1");
 
 /* ── LOGIN ── */
-function Login({ onLogin }) {
-  const [pwd, setPwd] = useState("");
-  const [err, setErr] = useState(false);
-  const check = () => {
-    if (pwd === "festival26") { onLogin(); }
-    else { setErr(true); setPwd(""); setTimeout(() => setErr(false), 1500); }
-  };
+/* ══ ACCESSO ══
+   La password serve solo la prima volta su un dispositivo. Poi si entra con PIN o
+   Face ID / impronta, che valgono solo su quel dispositivo: nel browser resta
+   un'impronta cifrata del PIN, mai il PIN. È una comodità per chi usa la cassa:
+   la protezione vera di dati e incassi dipende dalle regole di Firebase. */
+const CHIAVE_ACCESSO = CONFIG_PREFIX + "accesso";
+const LUNGHEZZA_PIN = 4, TENTATIVI_PIN = 5;
+const leggiAccesso = () => { try { return JSON.parse(localStorage.getItem(CHIAVE_ACCESSO) || "null") || {}; } catch (e) { return {}; } };
+const scriviAccesso = a => localStorage.setItem(CHIAVE_ACCESSO, JSON.stringify(a));
+
+const inHex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, "0")).join("");
+const daHex = h => Uint8Array.from((h.match(/../g) || []).map(x => parseInt(x, 16)));
+const casuali = n => crypto.getRandomValues(new Uint8Array(n));
+
+async function impronta(pin, sale, giri) {
+  const chiave = await crypto.subtle.importKey("raw", new TextEncoder().encode(pin), "PBKDF2", false, ["deriveBits"]);
+  return inHex(await crypto.subtle.deriveBits({ name:"PBKDF2", hash:"SHA-256", salt:daHex(sale), iterations:giri }, chiave, 256));
+}
+async function nuovoPin(pin) {
+  const sale = inHex(casuali(16)), giri = 150000;
+  return { sale, giri, hash:await impronta(pin, sale, giri) };
+}
+const pinDisponibile = () => !!(window.crypto && crypto.subtle);
+const biometriaDisponibile = async () => {
+  try { return !!(window.PublicKeyCredential && await PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable()); }
+  catch (e) { return false; }
+};
+async function attivaBiometria() {
+  const cred = await navigator.credentials.create({ publicKey:{
+    challenge:casuali(32), rp:{ name:"CassaPro" },
+    user:{ id:casuali(16), name:"cassapro", displayName:"CassaPro" },
+    pubKeyCredParams:[{ type:"public-key", alg:-7 }, { type:"public-key", alg:-257 }],
+    authenticatorSelection:{ authenticatorAttachment:"platform", userVerification:"required", residentKey:"discouraged" },
+    timeout:60000,
+  }});
+  return inHex(cred.rawId);
+}
+async function verificaBiometria(id) {
+  const prova = await navigator.credentials.get({ publicKey:{
+    challenge:casuali(32), allowCredentials:[{ type:"public-key", id:daHex(id), transports:["internal"] }],
+    userVerification:"required", timeout:60000,
+  }});
+  // Bit UV: il sistema conferma di aver riconosciuto davvero la persona
+  return inHex(prova.rawId) === id && (new Uint8Array(prova.response.authenticatorData)[32] & 4) !== 0;
+}
+
+function SchedaAccesso({ children }) {
   return (
     <div className="app-shell" style={{background:"#0f172a",display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"inherit",padding:20,overflowY:"auto"}}>
-      <div style={{background:"#1e293b",border:"1px solid #334155",borderRadius:20,padding:"clamp(18px,4vh,40px) 28px",textAlign:"center",width:"100%",maxWidth:340,margin:"auto",flexShrink:0}}>
-        <LogoCassaPro size={96} className="hide-short" style={{margin:"0 auto 12px"}} />
-        <div style={{fontSize:28,fontWeight:900,color:"#f8fafc",marginBottom:4,letterSpacing:"-0.5px"}}>CassaPro</div>
-        <div style={{fontSize:14,color:"#94a3b8",marginBottom:4}}>La cassa per i tuoi eventi</div>
-        <div style={{fontSize:13,color:"#64748b",marginBottom:24}}>Inserisci la password</div>
-        <input type="password" value={pwd}
-          onChange={e=>{setPwd(e.target.value);setErr(false);}}
-          onKeyDown={e=>e.key==="Enter"&&check()}
-          placeholder="Password" autoFocus
-          style={{width:"100%",background:err?"#3b0d0d":"#0f172a",border:`2px solid ${err?"#dc2626":"#334155"}`,color:err?"#f87171":"#e2e8f0",padding:"14px 16px",borderRadius:10,fontSize:18,fontFamily:"inherit",outline:"none",textAlign:"center",letterSpacing:6,marginBottom:10,transition:"all 0.2s"}}
-        />
-        {err && <div style={{color:"#f87171",fontSize:13,marginBottom:8}}>❌ Password errata</div>}
-        <button onClick={check} style={{width:"100%",background:"#dc2626",border:"none",color:"#fff",padding:16,borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:17,fontWeight:900,marginTop:6,letterSpacing:1}}>
-          ENTRA →
-        </button>
+      <div style={{background:"#1e293b",border:"1px solid #334155",borderRadius:20,padding:"clamp(18px,3vh,32px) 24px",textAlign:"center",width:"100%",maxWidth:340,margin:"auto",flexShrink:0}}>
+        <LogoCassaPro size={72} className="hide-short" style={{margin:"0 auto 10px"}} />
+        {children}
       </div>
+    </div>
+  );
+}
+const tastoAccesso = { width:"100%", background:"#334155", border:"none", color:"#fff", padding:14, borderRadius:10, cursor:"pointer", fontFamily:"inherit", fontSize:15, fontWeight:700, marginTop:8 };
+const linkAccesso = { background:"transparent", border:"none", color:"#94a3b8", padding:12, minHeight:44, cursor:"pointer", fontFamily:"inherit", fontSize:14, fontWeight:600 };
+
+function TastierinoPin({ titolo, sotto, errore, onCompleto, children }) {
+  const [pin, setPin] = useState("");
+  const premi = c => setPin(p => c === "del" ? p.slice(0, -1) : (p.length < LUNGHEZZA_PIN ? p + c : p));
+  useEffect(() => {
+    const tasto = e => {
+      if (/^[0-9]$/.test(e.key)) premi(e.key);
+      else if (e.key === "Backspace") premi("del");
+    };
+    window.addEventListener("keydown", tasto);
+    return () => window.removeEventListener("keydown", tasto);
+  }, []);
+  useEffect(() => {
+    if (pin.length !== LUNGHEZZA_PIN) return;
+    let vivo = true;
+    const t = setTimeout(async () => { await onCompleto(pin); if (vivo) setPin(""); }, 120);
+    return () => { vivo = false; clearTimeout(t); };
+  }, [pin]);
+
+  const cifra = { height:60, background:"#334155", border:"none", borderRadius:14, color:"#fff", fontFamily:"inherit", fontSize:24, fontWeight:700, cursor:"pointer" };
+  return (
+    <>
+      <div style={{fontSize:21,fontWeight:800,color:"#f8fafc"}}>{titolo}</div>
+      {sotto && <div style={{fontSize:13,color:"#94a3b8",marginTop:4}}>{sotto}</div>}
+      <div role="status" aria-label={"Cifre inserite: "+pin.length} style={{display:"flex",justifyContent:"center",gap:14,margin:"16px 0 8px"}}>
+        {[0,1,2,3].map(i => <span key={i} style={{width:14,height:14,borderRadius:7,border:"2px solid #94a3b8",background:i<pin.length?"#f8fafc":"transparent"}} />)}
+      </div>
+      <div style={{minHeight:20,fontSize:13,color:"#f87171",marginBottom:6}}>{errore}</div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(3, minmax(0, 1fr))",gap:10}}>
+        {["1","2","3","4","5","6","7","8","9"].map(c => <button key={c} onClick={()=>premi(c)} style={cifra}>{c}</button>)}
+        <span />
+        <button onClick={()=>premi("0")} style={cifra}>0</button>
+        <button aria-label="Cancella" onClick={()=>premi("del")} style={{...cifra,background:"transparent",color:"#94a3b8"}}>⌫</button>
+      </div>
+      {children}
+    </>
+  );
+}
+
+/* Crea o cambia il PIN: va scritto due volte */
+function ImpostaPin({ onFatto, onAltro, testoAltro }) {
+  const [primo, setPrimo] = useState(null);
+  const [errore, setErrore] = useState("");
+  const completo = async pin => {
+    if (primo === null) { setPrimo(pin); setErrore(""); return; }
+    if (pin !== primo) { setPrimo(null); setErrore("I PIN non coincidono: riprova."); return; }
+    onFatto(await nuovoPin(pin));
+  };
+  return (
+    <TastierinoPin key={primo === null ? "a" : "b"} titolo={primo === null ? "Crea il tuo PIN" : "Ripeti il PIN"}
+                   sotto="4 cifre, valide solo su questo dispositivo" errore={errore} onCompleto={completo}>
+      {onAltro && <button onClick={onAltro} style={{...linkAccesso,marginTop:4}}>{testoAltro}</button>}
+    </TastierinoPin>
+  );
+}
+
+function Login({ onLogin }) {
+  const [accesso, setAccesso] = useState(leggiAccesso);
+  const [modo, setModo] = useState(() => { const a = leggiAccesso(); return a.hash && (a.errori || 0) < TENTATIVI_PIN ? "pin" : "password"; });
+  const [pwd, setPwd] = useState("");
+  const [err, setErr] = useState(false);
+  const [errore, setErrore] = useState("");
+  const [bio, setBio] = useState(false);
+
+  useEffect(() => { biometriaDisponibile().then(setBio); }, []);
+
+  const aggiorna = a => { scriviAccesso(a); setAccesso(a); };
+  const check = () => {
+    if (pwd === "festival26") {
+      const a = {...leggiAccesso(), errori:0};
+      aggiorna(a);
+      if (a.hash || a.saltato || !pinDisponibile()) onLogin(); else setModo("crea");
+    }
+    else { setErr(true); setPwd(""); setTimeout(() => setErr(false), 1500); }
+  };
+  const controllaPin = async pin => {
+    const a = leggiAccesso();
+    if (await impronta(pin, a.sale, a.giri) === a.hash) { aggiorna({...a, errori:0}); onLogin(); return; }
+    const errori = (a.errori || 0) + 1;
+    aggiorna({...a, errori});
+    if (errori >= TENTATIVI_PIN) { setErrore(""); setModo("password"); }
+    else setErrore("PIN errato. Tentativi rimasti: " + (TENTATIVI_PIN - errori));
+  };
+  const entraConVolto = async () => {
+    setErrore("");
+    try {
+      if (await verificaBiometria(leggiAccesso().bio)) { aggiorna({...leggiAccesso(), errori:0}); onLogin(); }
+      else setErrore("Riconoscimento non riuscito.");
+    } catch (e) { setErrore("Riconoscimento annullato. Usa il PIN."); }
+  };
+  const fine = () => onLogin();
+  const creato = async dati => {
+    aggiorna({...leggiAccesso(), ...dati, saltato:false, errori:0});
+    if (bio) setModo("volto"); else fine();
+  };
+  const attivaVolto = async () => {
+    try { const id = await attivaBiometria(); aggiorna({...leggiAccesso(), bio:id}); fine(); }
+    catch (e) { setErrore("Attivazione annullata: potrai riprovare da Impostazioni."); }
+  };
+
+  if (modo === "crea") return (
+    <SchedaAccesso>
+      <ImpostaPin onFatto={creato} testoAltro="Non ora" onAltro={()=>{ aggiorna({...leggiAccesso(), saltato:true}); fine(); }} />
+    </SchedaAccesso>
+  );
+
+  if (modo === "volto") return (
+    <SchedaAccesso>
+      <div style={{fontSize:21,fontWeight:800,color:"#f8fafc"}}>Face ID o impronta</div>
+      <div style={{fontSize:14,color:"#94a3b8",margin:"6px 0 14px"}}>Vuoi entrare col riconoscimento di questo dispositivo?</div>
+      {errore && <div style={{fontSize:13,color:"#f87171",marginBottom:8}}>{errore}</div>}
+      <button onClick={attivaVolto} style={{...tastoAccesso,background:"#dc2626"}}>Attiva</button>
+      <button onClick={fine} style={linkAccesso}>Non ora</button>
+    </SchedaAccesso>
+  );
+
+  if (modo === "pin") return (
+    <SchedaAccesso>
+      <TastierinoPin titolo="CassaPro" sotto="Inserisci il PIN" errore={errore} onCompleto={controllaPin}>
+        {accesso.bio && bio && <button onClick={entraConVolto} style={tastoAccesso}>Usa Face ID o impronta</button>}
+        <button onClick={()=>{setErrore("");setModo("password");}} style={{...linkAccesso,marginTop:4}}>Usa la password</button>
+      </TastierinoPin>
+    </SchedaAccesso>
+  );
+
+  return (
+    <SchedaAccesso>
+      <div style={{fontSize:28,fontWeight:900,color:"#f8fafc",marginBottom:4,letterSpacing:"-0.5px"}}>CassaPro</div>
+      <div style={{fontSize:14,color:"#94a3b8",marginBottom:4}}>La cassa per i tuoi eventi</div>
+      <div style={{fontSize:13,color:(accesso.errori||0)>=TENTATIVI_PIN?"#f87171":"#64748b",marginBottom:20}}>
+        {(accesso.errori||0)>=TENTATIVI_PIN ? "Troppi PIN errati: inserisci la password" : "Inserisci la password"}
+      </div>
+      <input type="password" value={pwd}
+        onChange={e=>{setPwd(e.target.value);setErr(false);}}
+        onKeyDown={e=>e.key==="Enter"&&check()}
+        placeholder="Password" autoFocus
+        style={{width:"100%",background:err?"#3b0d0d":"#0f172a",border:`2px solid ${err?"#dc2626":"#334155"}`,color:err?"#f87171":"#e2e8f0",padding:"14px 16px",borderRadius:10,fontSize:18,fontFamily:"inherit",outline:"none",textAlign:"center",letterSpacing:4,marginBottom:12,boxSizing:"border-box"}}
+      />
+      {err && <div style={{color:"#f87171",fontSize:13,marginBottom:8}}>❌ Password errata</div>}
+      <button onClick={check} style={{width:"100%",background:"#dc2626",border:"none",color:"#fff",padding:16,borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:17,fontWeight:900,marginTop:6,letterSpacing:1}}>
+        ENTRA →
+      </button>
+      {accesso.hash && (accesso.errori||0) < TENTATIVI_PIN && <button onClick={()=>setModo("pin")} style={{...linkAccesso,marginTop:4}}>Usa il PIN</button>}
+    </SchedaAccesso>
+  );
+}
+
+/* Accesso di questo dispositivo, in Impostazioni */
+function CartaAccesso({ carrelloPieno }) {
+  const [accesso, setAccesso] = useState(leggiAccesso);
+  const [cambioPin, setCambioPin] = useState(false);
+  const [bio, setBio] = useState(false);
+  const [errore, setErrore] = useState("");
+  useEffect(() => { biometriaDisponibile().then(setBio); }, []);
+
+  const aggiorna = a => { scriviAccesso(a); setAccesso(a); };
+  const togliPin = () => {
+    if (!window.confirm("Togliere PIN e Face ID da questo dispositivo? Si entrerà con la password.")) return;
+    aggiorna({ saltato:true });
+  };
+  const attivaVolto = async () => {
+    setErrore("");
+    try { aggiorna({...leggiAccesso(), bio:await attivaBiometria()}); }
+    catch (e) { setErrore("Attivazione annullata."); }
+  };
+  const disattivaVolto = () => { const a = {...leggiAccesso()}; delete a.bio; aggiorna(a); };
+  const blocca = () => {
+    if (carrelloPieno && !window.confirm("L'ordine aperto andrà perso. Bloccare?")) return;
+    sessionStorage.removeItem(CONFIG_PREFIX+"auth");
+    window.location.reload();
+  };
+  const tasto = { background:"#334155", border:"1px solid #475569", color:"#fff", padding:"10px 12px", borderRadius:8, cursor:"pointer", fontFamily:"inherit", fontSize:13, fontWeight:700 };
+
+  return (
+    <div data-eventi style={{background:"#1e293b",borderRadius:12,padding:14,border:"1px solid #334155",marginBottom:14}}>
+      <div style={{fontSize:15,fontWeight:800,color:"#f8fafc"}}>🔒 Accesso su questo dispositivo</div>
+      <div style={{fontSize:12,color:"#94a3b8",marginBottom:10}}>
+        {accesso.hash ? (accesso.bio ? "PIN e Face ID o impronta attivi" : "PIN attivo") : "Si entra con la password"}
+      </div>
+      {errore && <div style={{fontSize:13,color:"#f87171",marginBottom:8}}>{errore}</div>}
+      <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+        {pinDisponibile() && <button onClick={()=>setCambioPin(true)} style={tasto}>{accesso.hash ? "Cambia PIN" : "Crea PIN"}</button>}
+        {accesso.hash && bio && !accesso.bio && <button onClick={attivaVolto} style={tasto}>Attiva Face ID</button>}
+        {accesso.bio && <button onClick={disattivaVolto} style={tasto}>Disattiva Face ID</button>}
+        {accesso.hash && <button onClick={togliPin} style={tasto}>Togli PIN</button>}
+        <button onClick={blocca} style={tasto}>Blocca ora</button>
+      </div>
+      {cambioPin && (
+        <div style={{position:"fixed",top:0,left:0,right:0,zIndex:9000}}>
+          <SchedaAccesso>
+            <ImpostaPin onFatto={d=>{ aggiorna({...leggiAccesso(), ...d, saltato:false, errori:0}); setCambioPin(false); }}
+                        testoAltro="Annulla" onAltro={()=>setCambioPin(false)} />
+          </SchedaAccesso>
+        </div>
+      )}
     </div>
   );
 }
@@ -2088,7 +2316,7 @@ function PaginaArticoli({ dati, isMobile }) {
 }
 
 /* ── PAGINA IMPOSTAZIONI ── */
-function PaginaImpostazioni({ dati, stampa, isMobile, apriEventi }) {
+function PaginaImpostazioni({ dati, cassa, stampa, isMobile, apriEventi }) {
   const { rcptCfg, saveRcptCfg, resetRcptCfg, centri, saveCentri, syncStatus } = dati;
   const { anteprimaScontrino } = stampa;
 
@@ -2097,6 +2325,7 @@ function PaginaImpostazioni({ dati, stampa, isMobile, apriEventi }) {
       <div style={{fontSize:18,fontWeight:900,color:"#f8fafc",marginBottom:14}}>⚙️ Impostazioni</div>
       <CartaEvento apriEventi={apriEventi} />
       <EditorPagine dati={dati} />
+      <CartaAccesso carrelloPieno={cassa.cart.length > 0} />
       <AdattaSchermo />
       <SceltaStampante />
       <div style={{background:"#1e293b",borderRadius:10,padding:14,border:"1px solid #334155",marginBottom:10}}>
@@ -2121,6 +2350,7 @@ function PaginaImpostazioni({ dati, stampa, isMobile, apriEventi }) {
       <h2 style={{fontSize:24,fontWeight:900,marginBottom:24,color:"#f8fafc"}}>⚙️ Impostazioni</h2>
       <CartaEvento apriEventi={apriEventi} />
       <EditorPagine dati={dati} />
+      <CartaAccesso carrelloPieno={cassa.cart.length > 0} />
       <AdattaSchermo />
       <SceltaStampante />
       <div style={{background:"#1e293b",borderRadius:12,padding:20,border:"1px solid #334155",marginBottom:16}}>
@@ -3787,7 +4017,7 @@ async function configEvento(id) {
 async function scaricaBackup(ev) {
   const prefisso = prefissoEvento(ev.id), locale = {};
   Object.keys(localStorage).forEach(k => {
-    if (k.startsWith(prefisso) && !k.startsWith(prefisso + "fb_") && k !== prefisso + "theme") locale[k] = localStorage.getItem(k);
+    if (k.startsWith(prefisso) && !k.startsWith(prefisso + "fb_") && k !== prefisso + "theme" && k !== CHIAVE_ACCESSO) locale[k] = localStorage.getItem(k);
   });
   const usaDb = db && !ev.soloLocale;
   const firebaseDati = usaDb ? (await conLimite(db.ref(radiceEvento(ev.id)).once("value"), 20000)).val() : null;
