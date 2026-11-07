@@ -642,6 +642,12 @@ function Login({ onLogin, serveAccount }) {
     aggiorna(a);
     if (a.hash || a.saltato || !pinDisponibile()) onLogin(); else setModo("crea");
   };
+  const [avviso, setAvviso] = useState("");
+  const dimenticata = async () => {
+    if (!email.trim()) { setAvviso("Scrivi prima la tua email."); return; }
+    try { await auth.sendPasswordResetEmail(email.trim()); setAvviso("Ti abbiamo mandato un'email per scegliere una nuova password."); }
+    catch (e) { setAvviso(e && e.code === "auth/network-request-failed" ? "Nessuna connessione: riprova." : "Email non trovata o non valida."); }
+  };
   const controllaPin = async pin => {
     const a = leggiAccesso();
     if (await impronta(pin, a.sale, a.giri) === a.hash) {
@@ -720,9 +726,183 @@ function Login({ onLogin, serveAccount }) {
         {attesa ? "Verifica…" : "ENTRA →"}
       </button>
       {!serveAccount && accesso.hash && (accesso.errori||0) < TENTATIVI_PIN && <button onClick={()=>setModo("pin")} style={{...linkAccesso,marginTop:4}}>Usa il PIN</button>}
+      {auth && <button onClick={dimenticata} style={{...linkAccesso,display:"block",margin:"0 auto"}}>Password dimenticata?</button>}
+      {avviso && <div style={{fontSize:13,color:"#94a3b8",marginTop:4}}>{avviso}</div>}
     </SchedaAccesso>
   );
 }
+
+/* ══ RUOLI ══
+   admin    tutto: eventi, pagine, menu, impostazioni, utenti, azzerare i report
+   cassiere casse, cucina e report
+   cucina   solo i display delle comande
+   Il ruolo sta in cassa/utenti/<uid>/ruolo. L'amministratore principale è fisso,
+   così non può restare chiuso fuori. Le stesse regole valgono nel database. */
+const ADMIN_PRINCIPALE = "Z5EDAsnxJaUlsODqJKrx6kzxIhJ2";
+const RUOLI = {
+  admin:    { nome:"Admin",    descr:"Gestisce tutto, anche utenti ed eventi" },
+  cassiere: { nome:"Cassiere", descr:"Casse, cucina e report" },
+  cucina:   { nome:"Cucina",   descr:"Solo i display delle comande" },
+};
+const PAGINE_PER_RUOLO = {
+  admin:    null,
+  cassiere: ["cassa", "cucina", "report", "impostazioni"],
+  cucina:   ["cucina", "impostazioni"],
+};
+const SESSIONE = { ruolo:null };
+const isAdmin = () => SESSIONE.ruolo === "admin";
+const paginaPermessa = p => { const ok = PAGINE_PER_RUOLO[SESSIONE.ruolo]; return !ok || ok.includes(p.tipo); };
+
+/* Ruolo dell'account entrato. Senza Firebase il dispositivo lavora da solo,
+   quindi ne è l'amministratore. */
+function useRuolo(utente) {
+  const [ruolo, setRuolo] = useState(null);
+  useEffect(() => {
+    if (!db || !utente) { setRuolo(db ? null : "admin"); return; }
+    if (utente.uid === ADMIN_PRINCIPALE) { setRuolo("admin"); return; }
+    setRuolo(null);
+    const ref = db.ref("cassa/utenti/" + utente.uid + "/ruolo");
+    const handler = snap => {
+      const r = snap.val();
+      setRuolo(RUOLI[r] ? r : "nessuno");
+      if (RUOLI[r]) localStorage.setItem(CONFIG_PREFIX + "ruolo", r);
+    };
+    // Senza rete vale l'ultimo ruolo visto su questo dispositivo
+    const riserva = setTimeout(() => {
+      const r = localStorage.getItem(CONFIG_PREFIX + "ruolo");
+      setRuolo(cur => cur || (RUOLI[r] ? r : null));
+    }, 4000);
+    ref.on("value", handler, () => setRuolo("nessuno"));
+    return () => { clearTimeout(riserva); ref.off("value", handler); };
+  }, [utente && utente.uid]);
+  return ruolo;
+}
+
+function NonAbilitato({ utente }) {
+  const esci = async () => {
+    try { await auth.signOut(); } catch (e) {}
+    localStorage.removeItem(CHIAVE_ACCESSO);
+    sessionStorage.removeItem(CONFIG_PREFIX + "auth");
+    window.location.reload();
+  };
+  return (
+    <SchedaAccesso>
+      <div style={{fontSize:20,fontWeight:800,color:"#f8fafc"}}>Account non abilitato</div>
+      <div style={{fontSize:14,color:"#94a3b8",margin:"8px 0 16px",overflowWrap:"anywhere"}}>
+        {utente && utente.email} non ha un ruolo in CassaPro. Chiedi all'amministratore di aggiungerti.
+      </div>
+      <button onClick={esci} style={tastoAccesso}>Esci</button>
+    </SchedaAccesso>
+  );
+}
+
+/* ── UTENTI ── Solo per l'amministratore, in Impostazioni */
+function GestioneUtenti() {
+  const [utenti, setUtenti] = useState({});
+  const [email, setEmail] = useState("");
+  const [pwd, setPwd] = useState("");
+  const [ruolo, setRuolo] = useState("cassiere");
+  const [msg, setMsg] = useState(null); // { ok, testo }
+  const [occupato, setOccupato] = useState(false);
+
+  useEffect(() => {
+    if (!db) return;
+    const ref = db.ref("cassa/utenti");
+    const handler = snap => setUtenti(snap.val() || {});
+    ref.on("value", handler, () => setMsg({ ok:false, testo:"Elenco utenti non leggibile: controlla le regole del database." }));
+    return () => ref.off("value", handler);
+  }, []);
+
+  if (!db || !auth) return null;
+
+  const esegui = async (azione, okTesto) => {
+    if (occupato) return;
+    setOccupato(true); setMsg(null);
+    try { await azione(); if (okTesto) setMsg({ ok:true, testo:okTesto }); }
+    catch (e) { setMsg({ ok:false, testo:spiegaErrore(e) }); }
+    setOccupato(false);
+  };
+
+  // L'account si crea in una connessione separata, così l'amministratore resta dentro
+  const aggiungi = () => esegui(async () => {
+    const mail = email.trim().toLowerCase();
+    if (!/^\S+@\S+\.\S+$/.test(mail)) throw { code:"email" };
+    if (pwd.length < 6) throw { code:"auth/weak-password" };
+    const esistente = Object.keys(utenti).find(k => (utenti[k].email || "").toLowerCase() === mail);
+    if (esistente) {
+      await db.ref("cassa/utenti/" + esistente).update({ ruolo });
+    } else {
+      const app = firebase.initializeApp(FIREBASE_CONFIG, "nuovo-utente-" + Date.now());
+      try {
+        const cred = await app.auth().createUserWithEmailAndPassword(mail, pwd);
+        await db.ref("cassa/utenti/" + cred.user.uid).set({ email:mail, ruolo, creato:new Date().toISOString() });
+        await app.auth().signOut();
+      } finally { try { await app.delete(); } catch (e) {} }
+    }
+    setEmail(""); setPwd("");
+  }, "Utente aggiunto: può entrare dal suo dispositivo.");
+
+  const cambiaRuolo = (uid, r) => esegui(() => db.ref("cassa/utenti/" + uid + "/ruolo").set(r));
+  const togli = (uid, u) => {
+    if (!window.confirm("Togliere l'accesso a " + u.email + "? Non potrà più entrare, anche se conosce la password.")) return;
+    esegui(() => db.ref("cassa/utenti/" + uid + "/ruolo").set("rimosso"), "Accesso tolto a " + u.email + ".");
+  };
+  const reimposta = u => esegui(() => auth.sendPasswordResetEmail(u.email), "Email per cambiare password inviata a " + u.email + ".");
+
+  const elenco = Object.keys(utenti).map(uid => ({ uid, ...utenti[uid] }))
+    .sort((a, b) => String(a.email).localeCompare(String(b.email)));
+  const campo = { width:"100%", boxSizing:"border-box", background:"#0f172a", border:"1px solid #334155", color:"#e2e8f0", padding:"10px 11px", borderRadius:8, fontSize:14, fontFamily:"inherit", outline:"none" };
+  const tasto = { background:"#334155", border:"none", color:"#fff", padding:"9px 11px", borderRadius:8, cursor:"pointer", fontFamily:"inherit", fontSize:12, fontWeight:700 };
+
+  return (
+    <div data-eventi style={{background:"#1e293b",borderRadius:12,padding:14,border:"1px solid #334155",marginBottom:14}}>
+      <div style={{fontSize:15,fontWeight:800,color:"#f8fafc"}}>👥 Utenti</div>
+      <div style={{fontSize:12,color:"#94a3b8",marginBottom:10}}>Ognuno entra con le sue credenziali. Valgono per tutti gli eventi.</div>
+      {msg && <div style={{background:msg.ok?"#14532d":"#7f1d1d",color:"#fff",borderRadius:8,padding:"8px 10px",fontSize:13,marginBottom:10}}>{msg.testo}</div>}
+
+      <div style={{background:"#0f172a",border:"1px solid #334155",borderRadius:10,padding:10,marginBottom:8,display:"flex",alignItems:"center",gap:8}}>
+        <div style={{flex:1,minWidth:0}}>
+          <div style={{fontSize:14,fontWeight:700,color:"#f8fafc"}}>Amministratore principale</div>
+          <div style={{fontSize:12,color:"#94a3b8"}}>Admin · non si può togliere</div>
+        </div>
+      </div>
+      {elenco.map(u => (
+        <div key={u.uid} data-utente={u.email} style={{background:"#0f172a",border:"1px solid #334155",borderRadius:10,padding:10,marginBottom:8,opacity:RUOLI[u.ruolo]?1:0.6}}>
+          <div style={{fontSize:14,fontWeight:700,color:"#f8fafc",overflowWrap:"anywhere"}}>{u.email}</div>
+          <div style={{display:"flex",gap:6,marginTop:8,flexWrap:"wrap",alignItems:"center"}}>
+            <select aria-label={"Ruolo di "+u.email} value={RUOLI[u.ruolo] ? u.ruolo : ""} disabled={occupato} onChange={e=>cambiaRuolo(u.uid, e.target.value)} style={{...campo,width:"auto",flex:"1 1 140px",padding:"8px"}}>
+              {!RUOLI[u.ruolo] && <option value="">Senza accesso</option>}
+              {Object.keys(RUOLI).map(r => <option key={r} value={r}>{RUOLI[r].nome}</option>)}
+            </select>
+            <button disabled={occupato} onClick={()=>reimposta(u)} style={tasto}>Reimposta password</button>
+            {RUOLI[u.ruolo] && <button disabled={occupato} onClick={()=>togli(u.uid, u)} style={{...tasto,background:"#7f1d1d",color:"#fca5a5"}}>Togli accesso</button>}
+          </div>
+        </div>
+      ))}
+
+      <div style={{borderTop:"1px solid #334155",marginTop:10,paddingTop:10}}>
+        <div style={{fontSize:13,fontWeight:800,color:"#f8fafc",marginBottom:8}}>➕ Aggiungi utente</div>
+        <input aria-label="Email nuovo utente" type="email" autoCapitalize="none" value={email} onChange={e=>setEmail(e.target.value)} placeholder="Email" style={campo} />
+        <input aria-label="Password provvisoria" type="text" autoCapitalize="none" autoComplete="new-password" value={pwd} onChange={e=>setPwd(e.target.value)} placeholder="Password provvisoria (almeno 6 caratteri)" style={{...campo,marginTop:8}} />
+        <select aria-label="Ruolo nuovo utente" value={ruolo} onChange={e=>setRuolo(e.target.value)} style={{...campo,marginTop:8}}>
+          {Object.keys(RUOLI).map(r => <option key={r} value={r}>{RUOLI[r].nome} — {RUOLI[r].descr}</option>)}
+        </select>
+        <button disabled={occupato} onClick={aggiungi} style={{...tasto,background:"#15803d",width:"100%",padding:12,fontSize:14,marginTop:8}}>{occupato ? "Attendi…" : "Aggiungi"}</button>
+        <div style={{fontSize:12,color:"#94a3b8",marginTop:6}}>Comunica tu email e password alla persona: potrà cambiarla con "Reimposta password".</div>
+      </div>
+    </div>
+  );
+}
+
+const spiegaErrore = e => ({
+  "email": "Email non valida.",
+  "auth/invalid-email": "Email non valida.",
+  "auth/weak-password": "La password deve avere almeno 6 caratteri.",
+  "auth/email-already-in-use": "Questa email ha già un account ma non è in elenco: usa un'altra email oppure chiedimi di recuperarla.",
+  "auth/network-request-failed": "Nessuna connessione: riprova.",
+  "auth/operation-not-allowed": "In Firebase la registrazione con email e password è disattivata.",
+  "PERMISSION_DENIED": "Il database ha rifiutato l'operazione: controlla le regole.",
+}[e && e.code] || (String(e && e.message || "").includes("PERMISSION_DENIED") ? "Il database ha rifiutato l'operazione: controlla le regole." : "Operazione non riuscita: riprova."));
 
 /* Accesso di questo dispositivo, in Impostazioni */
 function CartaAccesso({ carrelloPieno }) {
@@ -2195,7 +2375,7 @@ function PaginaReport({ dati: datiEvento, cassa, filtriReport, pagina, isMobile 
         ))}
       </div>
       <div style={{textAlign:"center",paddingBottom:20}}>
-        {!limitato && (
+        {!limitato && isAdmin() && (
         <button onClick={deleteAllOrders} style={{background:"#7f1d1d",border:"1px solid #991b1b",color:"#fca5a5",padding:"10px 20px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:13}}>
           🗑 Azzera Dati
         </button>
@@ -2288,7 +2468,7 @@ function PaginaReport({ dati: datiEvento, cassa, filtriReport, pagina, isMobile 
         </div>
       </div>
       <div style={{textAlign:"center",marginTop:16}}>
-        {!limitato && (
+        {!limitato && isAdmin() && (
         <button onClick={deleteAllOrders} style={{background:"#7f1d1d",border:"1px solid #991b1b",color:"#fca5a5",padding:"8px 20px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:13}}>🗑 Azzera Tutti i Dati</button>
         )}
       </div>
@@ -2379,7 +2559,8 @@ function PaginaImpostazioni({ dati, cassa, stampa, isMobile, apriEventi }) {
     <div style={{flex:1,overflowY:"auto",padding:"12px 10px"}}>
       <div style={{fontSize:18,fontWeight:900,color:"#f8fafc",marginBottom:14}}>⚙️ Impostazioni</div>
       <CartaEvento apriEventi={apriEventi} />
-      <EditorPagine dati={dati} />
+      {isAdmin() && <GestioneUtenti />}
+      {isAdmin() && <EditorPagine dati={dati} />}
       <CartaAccesso carrelloPieno={cassa.cart.length > 0} />
       <AdattaSchermo />
       <SceltaStampante />
@@ -2395,8 +2576,8 @@ function PaginaImpostazioni({ dati, cassa, stampa, isMobile, apriEventi }) {
       <button onClick={anteprimaScontrino} style={{width:"100%",background:"#1d4ed8",border:"1px solid #3b82f6",color:"#fff",padding:14,borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>
         🖨️ Scontrino di Prova
       </button>
-      <ScontrinoConfig cfg={rcptCfg} save={saveRcptCfg} reset={resetRcptCfg} anteprima={anteprimaScontrino} centri={centri} saveCentri={saveCentri} isMobile={true} />
-      <FirebaseConfig syncStatus={syncStatus} />
+      {isAdmin() && <ScontrinoConfig cfg={rcptCfg} save={saveRcptCfg} reset={resetRcptCfg} anteprima={anteprimaScontrino} centri={centri} saveCentri={saveCentri} isMobile={true} />}
+      {isAdmin() && <FirebaseConfig syncStatus={syncStatus} />}
     </div>
   );
 
@@ -2404,7 +2585,8 @@ function PaginaImpostazioni({ dati, cassa, stampa, isMobile, apriEventi }) {
     <div style={{padding:24,maxWidth:1000,margin:"0 auto",width:"100%",overflowY:"auto",flex:1,minHeight:0}}>
       <h2 style={{fontSize:24,fontWeight:900,marginBottom:24,color:"#f8fafc"}}>⚙️ Impostazioni</h2>
       <CartaEvento apriEventi={apriEventi} />
-      <EditorPagine dati={dati} />
+      {isAdmin() && <GestioneUtenti />}
+      {isAdmin() && <EditorPagine dati={dati} />}
       <CartaAccesso carrelloPieno={cassa.cart.length > 0} />
       <AdattaSchermo />
       <SceltaStampante />
@@ -2420,8 +2602,8 @@ function PaginaImpostazioni({ dati, cassa, stampa, isMobile, apriEventi }) {
         </div>
       </div>
       <button onClick={anteprimaScontrino} style={{background:"#1d4ed8",border:"1px solid #3b82f6",color:"#fff",padding:"10px 24px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:700}}>🖨️ Scontrino di Prova</button>
-      <ScontrinoConfig cfg={rcptCfg} save={saveRcptCfg} reset={resetRcptCfg} anteprima={anteprimaScontrino} centri={centri} saveCentri={saveCentri} isMobile={false} />
-      <FirebaseConfig syncStatus={syncStatus} />
+      {isAdmin() && <ScontrinoConfig cfg={rcptCfg} save={saveRcptCfg} reset={resetRcptCfg} anteprima={anteprimaScontrino} centri={centri} saveCentri={saveCentri} isMobile={false} />}
+      {isAdmin() && <FirebaseConfig syncStatus={syncStatus} />}
     </div>
   );
 }
@@ -2449,12 +2631,17 @@ function POS({ theme, toggleTheme, apriEventi }) {
   /* La pagina attiva nasce dall'elenco dell'evento. "cassa", "carrello" e "scontrino"
      sono fasi dell'incasso: valgono per l'ultima pagina Cassa aperta. Se una pagina
      viene tolta mentre è aperta, si passa alla prima disponibile. */
-  const { pagine } = dati;
+  // Ogni ruolo vede solo le sue pagine; la cucina ha sempre almeno un display
+  const pagine = React.useMemo(() => {
+    const ok = dati.pagine.filter(paginaPermessa);
+    if (SESSIONE.ruolo === "cucina" && !ok.some(p => p.tipo === "cucina")) ok.unshift(paginaDiTipo("cucina", "cucina"));
+    return ok;
+  }, [dati.pagine]);
   const [cassaAperta, setCassaAperta] = useState(null);
   const cassaCorrente = pagine.find(p => p.tipo === "cassa" && p.id === cassaAperta) || pagine.find(p => p.tipo === "cassa") || null;
   const inIncasso = view === "cassa" || view === "carrello";
-  const pagina = view === "scontrino" ? PAGINA_SCONTRINO
-    : (inIncasso ? cassaCorrente : pagine.find(p => p.id === view)) || pagine[0];
+  const pagina = view === "scontrino" && cassaCorrente ? PAGINA_SCONTRINO
+    : ((inIncasso ? cassaCorrente : pagine.find(p => p.id === view)) || pagine[0]);
   const vista = pagina.tipo === "cassa" ? (view === "carrello" ? "carrello" : "cassa") : pagina.id;
   const evidenziata = view === "carrello" || view === "scontrino" ? null : pagina.id;
   const apriPagina = p => {
@@ -4282,7 +4469,7 @@ function GestioneEventi({ registro, obbligatoria, carrelloPieno, nuovoEvento, on
 
         {errore && <div style={{background:"#7f1d1d",color:"#fff",borderRadius:10,padding:"10px 12px",fontSize:13,marginBottom:12}}>{errore}</div>}
 
-        {!attivi.length && <div style={{...carta,color:"#94a3b8",fontSize:14}}>Nessun evento attivo: creane uno o riaprine uno archiviato.</div>}
+        {!attivi.length && <div style={{...carta,color:"#94a3b8",fontSize:14}}>{isAdmin() ? "Nessun evento attivo: creane uno o riaprine uno archiviato." : "Nessun evento attivo: chiedi all'amministratore."}</div>}
 
         {attivi.map(ev => (
           <div key={ev.id} data-carta style={{...carta,border:"1px solid "+(ev.id===EVENTO_ID?"#dc2626":"#334155")}}>
@@ -4306,15 +4493,15 @@ function GestioneEventi({ registro, obbligatoria, carrelloPieno, nuovoEvento, on
                 </div>
               </div>
             )}
-            <div style={{display:"flex",gap:6,marginTop:10,flexWrap:"wrap"}}>
+            {isAdmin() && <div style={{display:"flex",gap:6,marginTop:10,flexWrap:"wrap"}}>
               <button disabled={occupato} onClick={()=>{setModifica(ev.id);setNuovoNome(ev.nome);}} style={tasto("#334155")}>✏️ Modifica</button>
               <button disabled={occupato} onClick={()=>backup(ev)} style={tasto("#334155")}>💾 Backup</button>
               <button disabled={occupato} onClick={()=>archivia(ev)} style={tasto("#334155")}>🗄 Archivia</button>
-            </div>
+            </div>}
           </div>
         ))}
 
-        <div style={{...carta,marginTop:16}}>
+        {isAdmin() && <div style={{...carta,marginTop:16}}>
           <div style={{fontSize:15,fontWeight:800,color:"#f8fafc",marginBottom:10}}>➕ Nuovo evento</div>
           <input value={nome} onChange={e=>setNome(e.target.value)} placeholder="Nome dell'evento" autoFocus={!!nuovoEvento} style={campo} />
           <select value={origine} onChange={e=>setOrigine(e.target.value)} aria-label="Punto di partenza" style={{...campo,marginTop:8}}>
@@ -4323,9 +4510,9 @@ function GestioneEventi({ registro, obbligatoria, carrelloPieno, nuovoEvento, on
           </select>
           <button disabled={occupato} onClick={crea} style={{...tasto("#15803d"),width:"100%",marginTop:10,padding:12,fontSize:15}}>Crea evento</button>
           <div style={{fontSize:12,color:"#94a3b8",marginTop:8}}>Incassi, comande e numerazione non vengono mai copiati.</div>
-        </div>
+        </div>}
 
-        {archiviati.length > 0 && (
+        {isAdmin() && archiviati.length > 0 && (
           <div style={{marginTop:16}}>
             <div style={{fontSize:13,fontWeight:800,color:"#94a3b8",marginBottom:8}}>🗄 ARCHIVIATI</div>
             {archiviati.map(ev => (
@@ -4360,7 +4547,7 @@ function SchermataIniziale({ onScegli, onNuovo }) {
         <div style={{fontSize:28,fontWeight:900,color:"#f8fafc",marginBottom:4,letterSpacing:"-0.5px"}}>CassaPro</div>
         <div style={{fontSize:14,color:"#94a3b8",marginBottom:24}}>La cassa per i tuoi eventi</div>
         <button onClick={onScegli} style={{...tasto,background:"#dc2626",marginBottom:10}}>🎪 Apri un evento</button>
-        <button onClick={onNuovo} style={{...tasto,background:"#334155"}}>➕ Nuovo evento</button>
+        {isAdmin() && <button onClick={onNuovo} style={{...tasto,background:"#334155"}}>➕ Nuovo evento</button>}
       </div>
     </div>
   );
@@ -4373,6 +4560,7 @@ function App() {
   const [theme, setTheme] = useState(()=>localStorage.getItem(CONFIG_PREFIX+"theme") || "dark");
   const [utente, setUtente] = useState(()=>auth ? auth.currentUser : null);
   const [authPronto, setAuthPronto] = useState(!auth);
+  const ruolo = useRuolo(auth ? utente : null);
 
   useEffect(()=>{
     document.documentElement.className = theme === "light" ? "light" : "";
@@ -4390,8 +4578,13 @@ function App() {
     return <div className="app-shell" style={{background:"#0f172a",color:"#94a3b8",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15}}>Caricamento…</div>;
   // Account scaduto o uscito: si rientra con email e password anche a sessione aperta
   if (auth && !utente) return <Login key="login" serveAccount onLogin={login}/>;
+  // Un account senza ruolo non arriva nemmeno a creare il PIN
+  if (ruolo === "nessuno") return <NonAbilitato utente={utente}/>;
   if (!authed) return <Login key="login" onLogin={login}/>;
-  return <Programma theme={theme} toggleTheme={toggleTheme}/>;
+  if (!ruolo)
+    return <div className="app-shell" style={{background:"#0f172a",color:"#94a3b8",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15}}>Caricamento…</div>;
+  SESSIONE.ruolo = ruolo;
+  return <Programma key={ruolo} theme={theme} toggleTheme={toggleTheme}/>;
 }
 
 function Programma({ theme, toggleTheme }) {
