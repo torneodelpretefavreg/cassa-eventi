@@ -25,6 +25,7 @@
   <!-- Firebase Realtime Database -->
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
   <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
+  <script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-auth-compat.js"></script>
   <script>
     /* ═══ EVENTI ═══
        Un solo programma per tanti eventi. Ogni evento ha i propri dati:
@@ -53,23 +54,29 @@
     const EVENT_PREFIX = prefissoEvento(EVENTO_ID);
     const DB_ROOT      = radiceEvento(EVENTO_ID);
 
-    // ⬇️ INCOLLA QUI LA TUA CONFIG FIREBASE (vedi sezione Impostazioni nel menu)
-    const FIREBASE_CONFIG = {
-      apiKey: localStorage.getItem(CONFIG_PREFIX+"fb_apiKey") || "",
-      authDomain: localStorage.getItem(CONFIG_PREFIX+"fb_authDomain") || "",
-      databaseURL: localStorage.getItem(CONFIG_PREFIX+"fb_databaseURL") || "",
-      projectId: localStorage.getItem(CONFIG_PREFIX+"fb_projectId") || "",
-      storageBucket: localStorage.getItem(CONFIG_PREFIX+"fb_storageBucket") || "",
-      messagingSenderId: localStorage.getItem(CONFIG_PREFIX+"fb_messagingSenderId") || "",
-      appId: localStorage.getItem(CONFIG_PREFIX+"fb_appId") || ""
+    /* Collegamento a Firebase, uguale per tutti i dispositivi. Questi valori non sono
+       segreti: a proteggere i dati sono l'account della cassa e le regole del database.
+       Una configurazione salvata nelle Impostazioni del dispositivo ha la precedenza. */
+    const FIREBASE_PREDEFINITO = {
+      apiKey: "AIzaSyBKirVggUBiqD4DSZnhhryoBZ_TNzpexck",
+      authDomain: "cassapro-tdp.firebaseapp.com",
+      databaseURL: "https://cassapro-tdp-default-rtdb.europe-west1.firebasedatabase.app",
+      projectId: "cassapro-tdp",
+      storageBucket: "cassapro-tdp.firebasestorage.app",
+      messagingSenderId: "808568764147",
+      appId: "1:808568764147:web:976aefd79f858e2311a986"
     };
-    let db = null;
+    const FIREBASE_CONFIG = localStorage.getItem(CONFIG_PREFIX+"fb_databaseURL")
+      ? Object.fromEntries(Object.keys(FIREBASE_PREDEFINITO).map(k => [k, localStorage.getItem(CONFIG_PREFIX+"fb_"+k) || ""]))
+      : FIREBASE_PREDEFINITO;
+    let db = null, auth = null;
     try {
-      if (FIREBASE_CONFIG.databaseURL) {
+      if (typeof firebase !== "undefined" && FIREBASE_CONFIG.databaseURL) {
         firebase.initializeApp(FIREBASE_CONFIG);
         db = firebase.database();
+        auth = firebase.auth ? firebase.auth() : null;
       }
-    } catch(e) { console.warn("Firebase non configurato:", e); }
+    } catch(e) { console.warn("Firebase non disponibile:", e); db = null; auth = null; }
   </script>
   <style>
     /* Tastierino PIN */
@@ -538,6 +545,7 @@ function SchedaAccesso({ children }) {
   );
 }
 const tastoAccesso = { width:"100%", background:"#334155", border:"none", color:"#fff", padding:14, borderRadius:10, cursor:"pointer", fontFamily:"inherit", fontSize:15, fontWeight:700, marginTop:8 };
+const campoAccesso = { width:"100%", background:"#0f172a", border:"2px solid #334155", color:"#e2e8f0", padding:"13px 14px", borderRadius:10, fontSize:16, fontFamily:"inherit", outline:"none", textAlign:"center", boxSizing:"border-box" };
 const linkAccesso = { background:"transparent", border:"none", color:"#94a3b8", padding:12, minHeight:44, cursor:"pointer", fontFamily:"inherit", fontSize:14, fontWeight:600 };
 
 function TastierinoPin({ titolo, sotto, errore, onCompleto, children }) {
@@ -599,10 +607,13 @@ function ImpostaPin({ onFatto, onAltro, testoAltro }) {
   );
 }
 
-function Login({ onLogin }) {
+function Login({ onLogin, serveAccount }) {
   const [accesso, setAccesso] = useState(leggiAccesso);
-  const [modo, setModo] = useState(() => { const a = leggiAccesso(); return a.hash && (a.errori || 0) < TENTATIVI_PIN ? "pin" : "password"; });
+  const [modo, setModo] = useState(() => { const a = leggiAccesso(); return !serveAccount && a.hash && (a.errori || 0) < TENTATIVI_PIN ? "pin" : "password"; });
+  const [email, setEmail] = useState(() => localStorage.getItem(CONFIG_PREFIX+"email") || "");
   const [pwd, setPwd] = useState("");
+  const [attesa, setAttesa] = useState(false);
+  const [msgErr, setMsgErr] = useState("");
   const [err, setErr] = useState(false);
   const [errore, setErrore] = useState("");
   const [bio, setBio] = useState(false);
@@ -610,13 +621,26 @@ function Login({ onLogin }) {
   useEffect(() => { biometriaDisponibile().then(setBio); }, []);
 
   const aggiorna = a => { scriviAccesso(a); setAccesso(a); };
-  const check = () => {
-    if (pwd === "festival26") {
-      const a = {...leggiAccesso(), errori:0};
-      aggiorna(a);
-      if (a.hash || a.saltato || !pinDisponibile()) onLogin(); else setModo("crea");
+  // Si entra con l'account della cassa creato in Firebase: la verifica la fa Firebase
+  const check = async () => {
+    if (attesa) return;
+    const sbaglio = m => { setMsgErr(m); setErr(true); setPwd(""); };
+    if (!auth) return sbaglio("Serve la connessione a internet per entrare.");
+    if (!email.trim() || !pwd) return sbaglio("Scrivi email e password.");
+    setAttesa(true);
+    try {
+      await auth.signInWithEmailAndPassword(email.trim(), pwd);
+      localStorage.setItem(CONFIG_PREFIX+"email", email.trim());
+    } catch (e) {
+      setAttesa(false);
+      const rete = e && e.code === "auth/network-request-failed";
+      const troppi = e && e.code === "auth/too-many-requests";
+      return sbaglio(rete ? "Nessuna connessione: riprova." : troppi ? "Troppi tentativi: riprova tra qualche minuto." : "Email o password errate.");
     }
-    else { setErr(true); setPwd(""); setTimeout(() => setErr(false), 1500); }
+    setAttesa(false);
+    const a = {...leggiAccesso(), errori:0};
+    aggiorna(a);
+    if (a.hash || a.saltato || !pinDisponibile()) onLogin(); else setModo("crea");
   };
   const controllaPin = async pin => {
     const a = leggiAccesso();
@@ -668,7 +692,7 @@ function Login({ onLogin }) {
     <SchedaAccesso>
       <TastierinoPin titolo="CassaPro" sotto="Inserisci il PIN" errore={errore} onCompleto={controllaPin}>
         {accesso.bio && bio && <button onClick={entraConVolto} style={tastoAccesso}>Usa Face ID o impronta</button>}
-        <button onClick={()=>{setErrore("");setModo("password");}} style={{...linkAccesso,marginTop:4}}>Usa la password</button>
+        <button onClick={()=>{setErrore("");setModo("password");}} style={{...linkAccesso,marginTop:4}}>PIN dimenticato? Entra con l'account</button>
       </TastierinoPin>
     </SchedaAccesso>
   );
@@ -678,84 +702,25 @@ function Login({ onLogin }) {
       <div style={{fontSize:28,fontWeight:900,color:"#f8fafc",marginBottom:4,letterSpacing:"-0.5px"}}>CassaPro</div>
       <div style={{fontSize:14,color:"#94a3b8",marginBottom:4}}>La cassa per i tuoi eventi</div>
       <div style={{fontSize:13,color:(accesso.errori||0)>=TENTATIVI_PIN?"#f87171":"#64748b",marginBottom:20}}>
-        {(accesso.errori||0)>=TENTATIVI_PIN ? "Troppi PIN errati: inserisci la password" : "Inserisci la password"}
+        {(accesso.errori||0)>=TENTATIVI_PIN ? "Troppi PIN errati: entra con l'account" : "Entra con l'account della cassa"}
       </div>
-      <input type="password" value={pwd}
+      <input type="email" value={email} autoComplete="username" autoCapitalize="none" inputMode="email"
+        onChange={e=>{setEmail(e.target.value);setErr(false);}}
+        placeholder="Email" autoFocus={!email}
+        style={{...campoAccesso,marginBottom:10}}
+      />
+      <input type="password" value={pwd} autoComplete="current-password"
         onChange={e=>{setPwd(e.target.value);setErr(false);}}
         onKeyDown={e=>e.key==="Enter"&&check()}
-        placeholder="Password" autoFocus
-        style={{width:"100%",background:err?"#3b0d0d":"#0f172a",border:`2px solid ${err?"#dc2626":"#334155"}`,color:err?"#f87171":"#e2e8f0",padding:"14px 16px",borderRadius:10,fontSize:18,fontFamily:"inherit",outline:"none",textAlign:"center",letterSpacing:4,marginBottom:12,boxSizing:"border-box"}}
+        placeholder="Password" autoFocus={!!email}
+        style={{...campoAccesso,background:err?"#3b0d0d":"#0f172a",borderColor:err?"#dc2626":"#334155",marginBottom:12}}
       />
-      {err && <div style={{color:"#f87171",fontSize:13,marginBottom:8}}>❌ Password errata</div>}
-      <button onClick={check} style={{width:"100%",background:"#dc2626",border:"none",color:"#fff",padding:16,borderRadius:10,cursor:"pointer",fontFamily:"inherit",fontSize:17,fontWeight:900,marginTop:6,letterSpacing:1}}>
-        ENTRA →
+      {err && <div style={{color:"#f87171",fontSize:13,marginBottom:8}}>❌ {msgErr}</div>}
+      <button onClick={check} disabled={attesa} style={{width:"100%",background:"#dc2626",border:"none",color:"#fff",padding:16,borderRadius:10,cursor:attesa?"wait":"pointer",opacity:attesa?0.7:1,fontFamily:"inherit",fontSize:17,fontWeight:900,marginTop:6,letterSpacing:1}}>
+        {attesa ? "Verifica…" : "ENTRA →"}
       </button>
-      {accesso.hash && (accesso.errori||0) < TENTATIVI_PIN && <button onClick={()=>setModo("pin")} style={{...linkAccesso,marginTop:4}}>Usa il PIN</button>}
+      {!serveAccount && accesso.hash && (accesso.errori||0) < TENTATIVI_PIN && <button onClick={()=>setModo("pin")} style={{...linkAccesso,marginTop:4}}>Usa il PIN</button>}
     </SchedaAccesso>
-  );
-}
-
-/* ── COLLEGAMENTO DEL DISPOSITIVO ──
-   Il collegamento a Firebase è salvato su ogni dispositivo, e l'icona sulla home di
-   iPhone ha una memoria sua, separata da Safari. Il codice evita di ricopiare a mano
-   tutti i campi. Non è scritto nel programma perché il codice è pubblico: va passato
-   solo a chi deve usare la cassa. */
-const CAMPI_FIREBASE = ["apiKey", "authDomain", "databaseURL", "projectId", "storageBucket", "messagingSenderId", "appId"];
-const codiceCollegamento = () => {
-  const cfg = {};
-  CAMPI_FIREBASE.forEach(k => { cfg[k] = localStorage.getItem(CONFIG_PREFIX + "fb_" + k) || ""; });
-  return "CP1." + btoa(JSON.stringify(cfg));
-};
-function applicaCollegamento(testo) {
-  const m = /CP1\.([A-Za-z0-9+/=]+)/.exec(String(testo));
-  if (!m) return false;
-  let cfg;
-  try { cfg = JSON.parse(atob(m[1])); } catch (e) { return false; }
-  if (!cfg || !/^https:\/\/\S+$/.test(cfg.databaseURL || "")) return false;
-  CAMPI_FIREBASE.forEach(k => {
-    if (cfg[k]) localStorage.setItem(CONFIG_PREFIX + "fb_" + k, String(cfg[k]));
-    else localStorage.removeItem(CONFIG_PREFIX + "fb_" + k);
-  });
-  return true;
-}
-
-function CollegaDispositivo() {
-  const [testo, setTesto] = useState("");
-  const [errore, setErrore] = useState(false);
-  const collega = () => {
-    if (applicaCollegamento(testo)) window.location.reload();
-    else setErrore(true);
-  };
-  return (
-    <div data-eventi style={{background:"#422006",border:"1px solid #92400e",borderRadius:12,padding:12,marginTop:14,textAlign:"left"}}>
-      <div style={{fontSize:14,fontWeight:800,color:"#fde68a"}}>Dispositivo non collegato</div>
-      <div style={{fontSize:12,color:"#fde68a",margin:"3px 0 8px"}}>Eventi e incassi restano solo qui. Incolla il codice preso da un dispositivo già collegato.</div>
-      <input aria-label="Codice di collegamento" value={testo} onChange={e=>{setTesto(e.target.value);setErrore(false);}} placeholder="Incolla il codice"
-             style={{width:"100%",boxSizing:"border-box",background:"#0f172a",border:"1px solid "+(errore?"#f87171":"#92400e"),color:"#e2e8f0",padding:11,borderRadius:8,fontSize:15,fontFamily:"inherit",outline:"none"}} />
-      {errore && <div style={{fontSize:12,color:"#fca5a5",marginTop:6}}>Codice non valido.</div>}
-      <button onClick={collega} style={{width:"100%",background:"#d97706",border:"none",color:"#fff",padding:12,borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:14,fontWeight:800,marginTop:8}}>Collega</button>
-    </div>
-  );
-}
-
-function CartaCollegamento() {
-  const [copiato, setCopiato] = useState(false);
-  const [testo, setTesto] = useState("");
-  if (!db) return <div data-eventi style={{marginBottom:14}}><CollegaDispositivo /></div>;
-  const copia = async () => {
-    const codice = codiceCollegamento();
-    try { await navigator.clipboard.writeText(codice); setCopiato(true); setTimeout(()=>setCopiato(false), 2500); }
-    catch (e) { setTesto(codice); }
-  };
-  return (
-    <div data-eventi style={{background:"#1e293b",borderRadius:12,padding:14,border:"1px solid #334155",marginBottom:14}}>
-      <div style={{fontSize:15,fontWeight:800,color:"#f8fafc"}}>🔗 Collega un altro dispositivo</div>
-      <div style={{fontSize:12,color:"#94a3b8",margin:"3px 0 10px"}}>Copia il codice e incollalo nella schermata iniziale dell'altro dispositivo. Dallo solo a chi lavora in cassa.</div>
-      <button onClick={copia} style={{background:"#334155",border:"1px solid #475569",color:"#fff",padding:"10px 12px",borderRadius:8,cursor:"pointer",fontFamily:"inherit",fontSize:13,fontWeight:700}}>
-        {copiato ? "✓ Codice copiato" : "Copia codice"}
-      </button>
-      {testo && <textarea readOnly value={testo} aria-label="Codice di collegamento" onFocus={e=>e.target.select()} style={{display:"block",width:"100%",boxSizing:"border-box",minHeight:80,marginTop:10,background:"#0f172a",border:"1px solid #334155",color:"#e2e8f0",borderRadius:8,padding:8,fontSize:12,fontFamily:"inherit"}} />}
-    </div>
   );
 }
 
@@ -778,6 +743,13 @@ function CartaAccesso({ carrelloPieno }) {
     catch (e) { setErrore("Attivazione annullata."); }
   };
   const disattivaVolto = () => { const a = {...leggiAccesso()}; delete a.bio; aggiorna(a); };
+  const esci = async () => {
+    if (!window.confirm("Uscire dall'account su questo dispositivo? Per rientrare serviranno email e password." + (carrelloPieno ? " L'ordine aperto andrà perso." : ""))) return;
+    try { await auth.signOut(); } catch (e) {}
+    localStorage.removeItem(CHIAVE_ACCESSO);
+    sessionStorage.removeItem(CONFIG_PREFIX+"auth");
+    window.location.reload();
+  };
   const blocca = () => {
     if (carrelloPieno && !window.confirm("L'ordine aperto andrà perso. Bloccare?")) return;
     sessionStorage.removeItem(CONFIG_PREFIX+"auth");
@@ -798,6 +770,7 @@ function CartaAccesso({ carrelloPieno }) {
         {accesso.bio && <button onClick={disattivaVolto} style={tasto}>Disattiva Face ID</button>}
         {accesso.hash && <button onClick={togliPin} style={tasto}>Togli PIN</button>}
         <button onClick={blocca} style={tasto}>Blocca ora</button>
+        {auth && <button onClick={esci} style={tasto}>Esci dall'account</button>}
       </div>
       {cambioPin && (
         <div style={{position:"fixed",top:0,left:0,right:0,zIndex:9000}}>
@@ -2407,7 +2380,6 @@ function PaginaImpostazioni({ dati, cassa, stampa, isMobile, apriEventi }) {
       <div style={{fontSize:18,fontWeight:900,color:"#f8fafc",marginBottom:14}}>⚙️ Impostazioni</div>
       <CartaEvento apriEventi={apriEventi} />
       <EditorPagine dati={dati} />
-      <CartaCollegamento />
       <CartaAccesso carrelloPieno={cassa.cart.length > 0} />
       <AdattaSchermo />
       <SceltaStampante />
@@ -2433,7 +2405,6 @@ function PaginaImpostazioni({ dati, cassa, stampa, isMobile, apriEventi }) {
       <h2 style={{fontSize:24,fontWeight:900,marginBottom:24,color:"#f8fafc"}}>⚙️ Impostazioni</h2>
       <CartaEvento apriEventi={apriEventi} />
       <EditorPagine dati={dati} />
-      <CartaCollegamento />
       <CartaAccesso carrelloPieno={cassa.cart.length > 0} />
       <AdattaSchermo />
       <SceltaStampante />
@@ -4390,15 +4361,40 @@ function SchermataIniziale({ onScegli, onNuovo }) {
         <div style={{fontSize:14,color:"#94a3b8",marginBottom:24}}>La cassa per i tuoi eventi</div>
         <button onClick={onScegli} style={{...tasto,background:"#dc2626",marginBottom:10}}>🎪 Apri un evento</button>
         <button onClick={onNuovo} style={{...tasto,background:"#334155"}}>➕ Nuovo evento</button>
-        {!db && <CollegaDispositivo />}
       </div>
     </div>
   );
 }
 
+/* Avvio: tema, account della cassa e sblocco del dispositivo. I dati si leggono
+   solo dopo, perché le regole del database li riservano all'account. */
 function App() {
   const [authed, setAuthed] = useState(()=>sessionStorage.getItem(CONFIG_PREFIX+"auth")==="1");
   const [theme, setTheme] = useState(()=>localStorage.getItem(CONFIG_PREFIX+"theme") || "dark");
+  const [utente, setUtente] = useState(()=>auth ? auth.currentUser : null);
+  const [authPronto, setAuthPronto] = useState(!auth);
+
+  useEffect(()=>{
+    document.documentElement.className = theme === "light" ? "light" : "";
+    localStorage.setItem(CONFIG_PREFIX+"theme", theme);
+  }, [theme]);
+  useEffect(()=>{
+    if (!auth) return;
+    return auth.onAuthStateChanged(u => { setUtente(u); setAuthPronto(true); });
+  }, []);
+
+  const toggleTheme = ()=>setTheme(t=>t==="dark"?"light":"dark");
+  const login = ()=>{sessionStorage.setItem(CONFIG_PREFIX+"auth","1");setAuthed(true);};
+
+  if (!authPronto)
+    return <div className="app-shell" style={{background:"#0f172a",color:"#94a3b8",display:"flex",alignItems:"center",justifyContent:"center",fontSize:15}}>Caricamento…</div>;
+  // Account scaduto o uscito: si rientra con email e password anche a sessione aperta
+  if (auth && !utente) return <Login key="login" serveAccount onLogin={login}/>;
+  if (!authed) return <Login key="login" onLogin={login}/>;
+  return <Programma theme={theme} toggleTheme={toggleTheme}/>;
+}
+
+function Programma({ theme, toggleTheme }) {
   const registro = useRegistroEventi();
   // Ogni nuova sessione parte dalla schermata iniziale. Ricaricare la pagina no:
   // l'evento aperto resta aperto finché la scheda è aperta.
@@ -4406,14 +4402,7 @@ function App() {
   const [elenco, setElenco] = useState(null); // null | "apri" | "nuovo"
   const [gestione, setGestione] = useState(null); // null | { carrelloPieno }
 
-  useEffect(()=>{
-    document.documentElement.className = theme === "light" ? "light" : "";
-    localStorage.setItem(CONFIG_PREFIX+"theme", theme);
-  }, [theme]);
-  useEffect(()=>{ document.title = authed && scelto ? "CassaPro — " + EVT.nomeLungo : "CassaPro"; }, [registro.reg, authed, scelto]);
-
-  const toggleTheme = ()=>setTheme(t=>t==="dark"?"light":"dark");
-  const login = ()=>{sessionStorage.setItem(CONFIG_PREFIX+"auth","1");setAuthed(true);};
+  useEffect(()=>{ document.title = scelto ? "CassaPro — " + EVT.nomeLungo : "CassaPro"; }, [registro.reg, scelto]);
 
   const attivi = registro.eventi.filter(e=>!e.archiviato);
   const apribile = attivi.some(e=>e.id===EVENTO_ID);
@@ -4421,8 +4410,6 @@ function App() {
   // Si entra in cassa solo da un evento scelto. Se quello aperto viene archiviato
   // da un altro dispositivo, si torna direttamente all'elenco.
   const scegli = registro.pronto && (!apribile || !scelto);
-
-  if (!authed) return <Login onLogin={login}/>;
 
   // In attesa dell'elenco: chi ha già un evento aperto entra subito
   if (!registro.pronto && !(scelto && apribile))
